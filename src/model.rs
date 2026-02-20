@@ -112,6 +112,15 @@ pub struct XLstmconfig {
     /// Whether to use input projection
     #[config(default = "true")]
     pub use_projection: bool,
+    /// Whether to use Causal Conv1D preprocessing in blocks
+    #[config(default = "false")]
+    pub use_conv: bool,
+    /// Size of the convolution kernel (1 for linear, 4 for conv4)
+    #[config(default = "4")]
+    pub conv_kernel_size: usize,
+    /// Whether to append an MLP mapping function in blocks
+    #[config(default = "false")]
+    pub use_mlp: bool,
     /// Weight initializer
     #[config(default = "Initializer::XavierNormal{gain:1.0}")]
     pub initializer: Initializer,
@@ -145,6 +154,9 @@ impl XLstmconfig {
                 )
                 .with_num_heads(self.num_heads)
                 .with_dropout(self.dropout)
+                .with_use_conv(self.use_conv)
+                .with_conv_kernel_size(self.conv_kernel_size)
+                .with_use_mlp(self.use_mlp)
                 .with_initializer(self.initializer.clone())
                 .init(device)
             })
