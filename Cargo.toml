@@ -64,6 +64,10 @@ path = "src/bin/dual_test.rs"
 name = "pro_trainer"
 path = "src/pro_trainer.rs"
 
+[[bin]]
+name = "mlstm_mingru_chat"
+path = "src/mlstm_mingru_chat.rs"
+
 [profile.release]
 #opt-level = 3
 #lto = "fat"

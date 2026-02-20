@@ -14,6 +14,8 @@ $env:RUST_BACKTRACE=1; cargo run --release --bin slstmchat -- input.txt
 
 $env:RUST_BACKTRACE=1; cargo run --release --bin mingruchat -- input.txt
 
+$env:RUST_BACKTRACE=1; cargo run --release --bin mlstm_mingru_chat -- input.txt
+
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- ./data
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- /media/emabertey/500 wu/Repos
 cargo run --release --bin mlstmchat -- input.txt

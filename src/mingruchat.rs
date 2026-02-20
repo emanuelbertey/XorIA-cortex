@@ -320,7 +320,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let text_file = &args[1];
     let tokenizer_path = "tokenizer_mingru.json";
-    let model_path = "mingru_chat_model_mingru";
+    let model_path = "mingru_chat_model_conv_mlp";
 
     // Intentar leer vocab_size de argumentos o usar 2000 por defecto
     let target_vocab_size = 1024;
