@@ -329,7 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let text_file = &args[1];
     let tokenizer_path = "tokenizer.json";
-    let model_path = "xlstm_chat_model_xlstm";
+    let model_path = "SLSTM_chat_model";
 
     // Intentar leer vocab_size de argumentos o usar 2000 por defecto
     let target_vocab_size = 1024;
@@ -360,7 +360,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let num_layers = 1;//let num_layers = 2;
     let num_blocks = 2; //let num_blocks = 4;
     let output_size = vocab_size; 
-    let dropout = 0.3;
+    let dropout = 0.2;
 
     let seq_length = 128; //32 Reducido para evitar explosión de memoria
     let batch_size = 16; // Mucho más seguro para CPU
@@ -396,7 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
      let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, output_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::SLSTM) 
+        .with_lstm_type(LstmType::SLSTM)  
         .with_initializer(burn::nn::Initializer::XavierNormal { gain: 1.0 })
         .with_use_projection(true);   
 

@@ -12,7 +12,7 @@ use burn::{
     config::Config,
     module::{Module, Param},
     nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig},
-    tensor::{Tensor, activation, backend::Backend},
+    tensor::{Tensor, backend::Backend},
 };
 use num_traits::{FromPrimitive, ToPrimitive};
 
@@ -71,9 +71,30 @@ pub struct MLstmconfig {
     /// Dropout probability
     #[config(default = "0.0")]
     pub dropout: f64,
-    /// Weight initializer
-    #[config(default = "Initializer::XavierNormal{gain:0.1}")]
+    /// Weight initializer (Default: GPT-style gold standard)
+    #[config(default = "Initializer::Normal{mean: 0.0, std: 0.02}")]
     pub initializer: Initializer,
+    /// Weight standard deviation for some initializers
+    #[config(default = "0.02")]
+    pub weight_stdev: f64,
+    /// Forget gate neutral (log(1.0)=0)
+    #[config(default = "1.0")]
+    pub forget_bias: f32,
+    /// Input gate bias
+    #[config(default = "-2.0")] 
+    pub input_bias: f32,
+    /// Epsilon for numerical stability
+    #[config(default = "1e-6")]
+    pub epsilon: f32,
+    /// Minimum value for exponential clamping
+    #[config(default = "-30.0")]
+    pub exp_clamp_min: f32,
+    /// Maximum value for exponential clamping
+    #[config(default = "30.0")]
+    pub exp_clamp_max: f32,
+    /// Initial value for the stabilizer (Log-space neutral approx -infinity)
+    #[config(default = "-10.0")]
+    pub stabilizer_init: f32,
 }
 impl MLstmconfig {
     /// Initialize a new mLSTM
@@ -81,7 +102,7 @@ impl MLstmconfig {
         let layers = (0..self.num_layers)
             .map(|i| {
                 let input_size = if i == 0 { self.d_input } else { self.d_hidden };
-                MLstmcell::new(input_size, self.d_hidden, self.num_heads, &self.initializer, device)
+                MLstmcell::new(input_size, self.d_hidden, self.num_heads, self, device)
             })
             .collect();
 
@@ -93,6 +114,12 @@ impl MLstmconfig {
             num_layers: self.num_layers,
             num_heads: self.num_heads,
             dropout: self.dropout,
+            forget_bias: self.forget_bias,
+            input_bias: self.input_bias,
+            epsilon: self.epsilon,
+            exp_clamp_min: self.exp_clamp_min,
+            exp_clamp_max: self.exp_clamp_max,
+            stabilizer_init: self.stabilizer_init,
         }
     }
 }
@@ -114,6 +141,18 @@ pub struct MLstm<B: Backend> {
     pub num_heads: usize,
     /// Dropout probability
     pub dropout: f64,
+    /// Forget gate neutral (log(1.0)=0)
+    pub forget_bias: f32,
+    /// Input gate bias
+    pub input_bias: f32,
+    /// Epsilon for numerical stability
+    pub epsilon: f32,
+    /// Minimum value for exponential clamping
+    pub exp_clamp_min: f32,
+    /// Maximum value for exponential clamping
+    pub exp_clamp_max: f32,
+    /// Initial value for the stabilizer
+    pub stabilizer_init: f32,
 }
 
 impl<B: Backend> MLstm<B> {
@@ -180,7 +219,7 @@ impl<B: Backend> MLstm<B> {
                     Tensor::zeros([batch_size, self.num_heads, head_dim, head_dim], device),
                     Tensor::zeros([batch_size, self.d_hidden], device),
                     Tensor::zeros([batch_size, self.num_heads, head_dim], device),
-                    Tensor::zeros([batch_size, self.num_heads, 1], device),
+                    Tensor::zeros([batch_size, self.num_heads, 1], device).add_scalar(self.stabilizer_init),
                 )
             })
             .collect()
@@ -206,6 +245,12 @@ pub struct MLstmcell<B: Backend> {
     pub hidden_size: usize,
     /// Number of heads
     pub num_heads: usize,
+    /// Epsilon for numerical stability
+    pub epsilon: f32,
+    /// Minimum value for exponential clamping
+    pub exp_clamp_min: f32,
+    /// Maximum value for exponential clamping
+    pub exp_clamp_max: f32,
 }
 
 impl<B: Backend> MLstmcell<B> {
@@ -213,31 +258,31 @@ impl<B: Backend> MLstmcell<B> {
         input_size: usize,
         hidden_size: usize,
         num_heads: usize,
-        initializer: &Initializer,
+        config: &MLstmconfig,
         device: &B::Device,
     ) -> Self {
         let mut bias_data = alloc::vec![0.0; 3 * num_heads];
         for i in 0..num_heads {
-            bias_data[i] = -2.0;             // Input gate: Neutral (exp(0) = 1)
-            bias_data[i + num_heads] = 0.0; // Forget gate: Moderate decay initial
-            bias_data[i + 2 * num_heads] = 1.0; // Output gate
+            bias_data[i] = config.input_bias;             // Input gate: Aligned with config
+            bias_data[i + num_heads] = config.forget_bias; // Forget gate: Aligned with config
+            bias_data[i + 2 * num_heads] = 0.0;            // Output gate: Default 0.0
         }
         let bias = Tensor::from_floats(bias_data.as_slice(), device);
 
-        // Initialize Q, K, V with standard gain (1.0)
+        // Initialize Q, K, V with configured initializer
         let w_q = LinearConfig::new(input_size, hidden_size)
             .with_bias(false)
-            .with_initializer(Initializer::XavierNormal { gain: 1.0 })
+            .with_initializer(config.initializer.clone())
             .init(device);
         let w_k = LinearConfig::new(input_size, hidden_size)
             .with_bias(false)
-            .with_initializer(Initializer::XavierNormal { gain: 1.0 })
+            .with_initializer(config.initializer.clone())
             .init(device);
         let w_v = LinearConfig::new(input_size, hidden_size)
             .with_bias(false)
-            .with_initializer(Initializer::XavierNormal { gain: 1.0 })
+            .with_initializer(config.initializer.clone())
             .init(device);
-        let weight_ih = initializer.init_with(
+        let weight_ih = config.initializer.init_with(
             [3 * num_heads, input_size],
             Some(input_size),
             Some(3 * num_heads),
@@ -253,6 +298,9 @@ impl<B: Backend> MLstmcell<B> {
             input_size,
             hidden_size,
             num_heads,
+            epsilon: config.epsilon,
+            exp_clamp_min: config.exp_clamp_min,
+            exp_clamp_max: config.exp_clamp_max,
         }
     }
 
@@ -312,9 +360,16 @@ impl<B: Backend> MLstmcell<B> {
         
         let i_log = gates.clone().slice([0..batch_size, 0..seq_len, 0..self.num_heads]).swap_dims(1, 2).reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]); // [B, H, S, 1]
         let f_log = gates.clone().slice([0..batch_size, 0..seq_len, self.num_heads..2*self.num_heads]).swap_dims(1, 2).reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]);
-        let o_gate = activation::sigmoid(gates.clone().slice([0..batch_size, 0..seq_len, 2*self.num_heads..3*self.num_heads]))
+        
+        // Estabilización por Clamping (PAPER ACCURATE)
+        let i_log = i_log.clamp(self.exp_clamp_min, self.exp_clamp_max);
+        let f_log = f_log.clamp(self.exp_clamp_min, self.exp_clamp_max);
+        let o_log = gates.clone().slice([0..batch_size, 0..seq_len, 2*self.num_heads..3*self.num_heads])
             .swap_dims(1, 2)
             .reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]); // [B, H, S, 1]
+        
+        let o_log = o_log.clamp(self.exp_clamp_min, self.exp_clamp_max);
+
 
         // Forget gate log-space stable (PAPER ACCURATE: pure log-projection)
         let f_log_val = f_log; 
@@ -383,11 +438,8 @@ impl<B: Backend> MLstmcell<B> {
         // 1. Producto punto q * k_k^T para todas las combinaciones t, k
         let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
         */
-        // 1. Producto punto q * k_k^T con escalado de estabilidad
-        let head_dim_f = head_dim as f32;
-        let scale = 1.0 / head_dim_f.sqrt(); 
-
-        let qk = q.clone().matmul(k.clone().swap_dims(2, 3)) * scale;// Standard attention scores
+        // 1. Producto punto q * k_k^T (PAPER ACCURATE: No scaling in matrix read)
+        let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
 
         // 2. Aplicamos los pesos de decaimiento escalares a las puntuaciones de atención
         // baseline let attention_scores = weights.clone() * qk.clone(); // [B, H, S, S]
@@ -400,9 +452,7 @@ impl<B: Backend> MLstmcell<B> {
         // 4. Contribución del estado inicial (PAPER ACCURATE)
         // h_0 = weights_initial * (C_0 @ q_t)
         // q es [B, H, S, D], Cell es [B, H, D, D].
-        // Matmul(q, Cell.transpose) -> [B, H, S, D]
-       // baseline  let h_initial = q.clone().matmul(state.cell.clone().swap_dims(2, 3)) * initial_scale.clone();
-        let h_initial = (q.clone() * scale).matmul(state.cell.clone().swap_dims(2, 3)) * initial_scale.clone();
+        let h_initial = q.clone().matmul(state.cell.clone().swap_dims(2, 3)) * initial_scale.clone();
         // --- Denominator (n_t^T @ q_t) ---
         // n_parallel = sum_k weights[t, k] * k_k
         let n_parallel = weights.clone().matmul(k.clone()); // [B, H, S, D]
@@ -414,27 +464,21 @@ impl<B: Backend> MLstmcell<B> {
         
         let denominator = n_dot_q_parallel + n_initial_dot_q;
         */
-       // n_initial_dot_q = weights_initial * ( (q * scale) @ n_0 )
-        let n_initial_dot_q = ((q.clone() * scale) * state.normalizer.clone().reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]))
+        // n_initial_dot_q = weights_initial * ( q_t @ n_0 )
+        let n_initial_dot_q = (q.clone() * state.normalizer.clone().reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]))
         .sum_dim(3)
         .reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]) * initial_scale.clone();
 
-        let denominator = (n_dot_q_parallel * scale) + n_initial_dot_q;
+        let denominator = n_dot_q_parallel + n_initial_dot_q;
 
         // Estabilización final escalar (PAPER ACCURATE: max(|n^T q|, 1))
-        /*// Debug: Quitamos el max(1) que pisa la señal y usamos epsilon
-        let epsilon = 1e-6;
-        let denominator_stable = denominator.abs() + epsilon; 
-
-        let h_normalized = (h_parallel + h_initial) / denominator_stable;*/
-
-        let ones = Tensor::ones_like(&denominator);
-        let denominator_stable = denominator.abs().max_pair(ones); 
+        let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator)); 
         
         let h_normalized = (h_parallel + h_initial) / denominator_stable;
         
-        // --- Output Gate (PAPER ACCURATE per head) ---
-        // h_gated = h_normalized * o_gate -> [B, H, S, D] * [B, H, S, 1]
+        // --- Output Gate (PAPER ACCURATE: Exponential gating stabilized) ---
+        // h_gated = exp(o_t - m_t) * h_normalized
+        let o_gate = (o_log - m_t_global.clone()).exp();
         let h_gated = h_normalized * o_gate;
         
         // Recombinar cabezas para la salida final: [B, H, S, D] -> [B, S, Hidden]
@@ -503,9 +547,10 @@ impl<B: Backend> MLstmcell<B> {
             + self.bias.val().reshape::<2, _>([1, 3 * self.num_heads]);
 
         let chunks = gates.chunk(3, 1);
-        let i_log = chunks[0].clone().reshape::<2, _>([batch_size, self.num_heads]);
-        let f_log = chunks[1].clone().reshape::<2, _>([batch_size, self.num_heads]);
-        let o_gate = activation::sigmoid(chunks[2].clone()).reshape::<3, _>([batch_size, self.num_heads, 1]);
+        let i_log = chunks[0].clone().reshape::<2, _>([batch_size, self.num_heads]).clamp(self.exp_clamp_min, self.exp_clamp_max);
+        let f_log = chunks[1].clone().reshape::<2, _>([batch_size, self.num_heads]).clamp(self.exp_clamp_min, self.exp_clamp_max);
+        let o_log = chunks[2].clone().reshape::<2, _>([batch_size, self.num_heads]).clamp(self.exp_clamp_min, self.exp_clamp_max);
+
 
         // Projections
         let q = self.w_q.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
@@ -533,17 +578,17 @@ impl<B: Backend> MLstmcell<B> {
             (cn, nn)
         };
 
-        let head_dim_f = head_dim as f32;
-        let scale = 1.0 / head_dim_f.sqrt();
-        let h_heads = (q.clone() * scale).matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2);
+        // Read Memory: C_t @ q_t (No scaling factor)
+        let h_heads = q.clone().matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2);
         
-        let q_step = (q.clone() * scale).reshape::<3, _>([batch_size, self.num_heads, head_dim]);
+        let q_step = q.clone().reshape::<3, _>([batch_size, self.num_heads, head_dim]);
         let denominator = (n_new.clone() * q_step).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
         
-        let ones = Tensor::ones_like(&denominator);
-        let denominator_stable = denominator.abs().max_pair(ones);
+        let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator));
         let h_normalized = h_heads / denominator_stable;
         
+        // o_gate stabilized (PAPER ACCURATE)
+        let o_gate = (o_log.reshape::<3, _>([batch_size, self.num_heads, 1]) - m_t.clone().reshape::<3, _>([batch_size, self.num_heads, 1])).exp();
         let h_new = (h_normalized * o_gate).reshape::<2, _>([batch_size, self.hidden_size]);
 
         if frozen {

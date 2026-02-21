@@ -10,7 +10,7 @@ Author: Based on xlstm-rs project
 Date: January 2026
 */
 
-use burn::grad_clipping::GradientClippingConfig;
+
 
 use burn::optim::decay::WeightDecayConfig;
 use burn::{
@@ -19,26 +19,27 @@ use burn::{
     optim::AdamConfig,
     record::{CompactRecorder, Recorder},
     tensor::{activation::softmax, Tensor, backend::{AutodiffBackend, Backend}},
+    nn::loss::CrossEntropyLossConfig,
 };
+use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::TensorData;
 use burn_autodiff::Autodiff;
-use burn_wgpu::{Wgpu, WgpuDevice};
+//use burn_wgpu::{Wgpu, WgpuDevice};
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
-
+use burn_ndarray::NdArray;
 use tokenizers::decoders::metaspace::Metaspace as MetaspaceDecoder;
-use tokenizers::models::bpe::{BPE, BpeTrainerBuilder};
+use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
 use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 use tokenizers::tokenizer::Tokenizer as HFTokenizer;
 use tokenizers::models::TrainerWrapper;
-use std::collections::HashSet;
 
 use xlstm::{LearningRateConfig, LstmType, XLstm, XLstmconfig};
-
-type MyBackend = Autodiff<Wgpu<f32, i32>>;
+type MyBackend = Autodiff<NdArray<f32>>;
+//type MyBackend = Autodiff<Wgpu<f32, i32>>;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
 pub struct Tokenizer {
@@ -48,7 +49,6 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Crea un nuevo tokenizador BPE entrenado desde un texto
     pub fn from_text(text: &str, vocab_size: usize) -> Result<Self, Box<dyn Error>> {
-        // Usar byte_fallback para manejar caracteres desconocidos
         let model = BPE::builder()
             .byte_fallback(true)
             .build()
@@ -66,16 +66,10 @@ impl Tokenizer {
         // AGREGAR DECODER PARA QUE 'decode' NO META ESPACIOS ENTRE SUB-TOKENS
         tokenizer.with_decoder(Some(MetaspaceDecoder::new('▁', PrependScheme::Always, true)));
 
-        // Asegurar que caracteres de control básicos estén en el alfabeto inicial
-        let mut alphabet = HashSet::new();
-        alphabet.insert('\n');
-        alphabet.insert(' ');
-
         let trainer = BpeTrainerBuilder::default()
             .show_progress(true)
             .vocab_size(vocab_size)
-            .min_frequency(0) // Permitir todos para empezar
-            .initial_alphabet(alphabet)
+            .min_frequency(2)
             .build();
 
         // Envolver el entrenador de manera genérica usando el trait From
@@ -104,7 +98,7 @@ impl Tokenizer {
         let mut tokenizer = HFTokenizer::from_file(path)
             .map_err(|e| format!("Error al cargar: {}", e))?;
             
-        // IMPORTANTE: Incluso al cargar, debemos asegurar el decoder para que no rompa palabras
+        // Asegurar el decoder al cargar
         tokenizer.with_decoder(Some(MetaspaceDecoder::new('▁', PrependScheme::Always, true)));
         
         println!("Tokenizador cargado desde: {}", path);
@@ -120,7 +114,7 @@ impl Tokenizer {
     /// Convierte índices a texto
     pub fn decode(&self, indices: &[usize]) -> String {
         let u32_indices: Vec<u32> = indices.iter().map(|&idx| idx as u32).collect();
-        self.tokenizer.decode(&u32_indices, true).expect("Error al decodificar")
+        self.tokenizer.decode(&u32_indices, true).unwrap()
     }
 
     /// Obtiene el tamaño del vocabulario
@@ -134,13 +128,13 @@ impl Tokenizer {
     }
 }
 
+
 /// Crea un batch de entrenamiento (one-hot) de forma eficiente usando una matriz identidad
 fn create_batch<B: AutodiffBackend>(
     tokens: &[usize],
     start_idx: usize,
     batch_size: usize,
     seq_length: usize,
-    stride: usize, // NEW ARGUMENT
     vocab_size: usize,
     device: &B::Device,
 ) -> (Tensor<B, 3>, Tensor<B, 2, burn::tensor::Int>) {
@@ -148,10 +142,14 @@ fn create_batch<B: AutodiffBackend>(
     let mut y_indices = Vec::with_capacity(batch_size * seq_length);
 
     for i in 0..batch_size {
-        let current_start = start_idx + i * stride; // FIX: Multiply by stride
+        let current_start = start_idx + i;
         for j in 0..seq_length {
-            x_indices.push(tokens[current_start + j] as i32);
-            y_indices.push(tokens[current_start + j + 1] as i32);
+            // PADDING: Si nos salimos del texto, rellenamos con 0
+            let x_idx = if current_start + j < tokens.len() { tokens[current_start + j] } else { 0 };
+            let y_idx = if current_start + j + 1 < tokens.len() { tokens[current_start + j + 1] } else { 0 };
+            
+            x_indices.push(x_idx as i64);
+            y_indices.push(y_idx as i64);
         }
     }
 
@@ -227,8 +225,8 @@ where
 
     let sum: f32 = weights.iter().sum();
     use rand::Rng;
-    let mut rng = rand::rng(); // Usar API moderna rand::rng()
-    let sample: f32 = rng.random::<f32>() * sum; // Usar random() en lugar de gen()
+    let mut rng = rand::rng(); 
+    let sample: f32 = rng.random::<f32>() * sum; 
 
     let mut cumulative = 0.0;
 
@@ -242,7 +240,11 @@ where
     indices[0]
 }
 
+
+
 /// Genera texto de forma recurrente manteniendo el estado interno del modelo
+/// Genera texto de forma recurrente manteniendo el estado interno de la mLSTM
+/// Genera texto de forma recurrente manteniendo el estado interno de la mLSTM
 fn generate_text<B: Backend>(
     model: &XLstm<B>,
     tokenizer: &Tokenizer,
@@ -263,20 +265,10 @@ where
 
     let eye = Tensor::<B, 2>::eye(vocab_size, device);
     
-    // 1. IMPORTANTE: No definas el tipo de current_state. 
-    // Al ser una variable local, Rust infiere el tipo privado de la librería automáticamente.
     let mut current_state = None; 
     let mut current_tokens = seed_tokens.clone();
 
-    // Procesar la semilla primero para calentar el estado
-    // (Esto ya se hace en el loop abajo si i=0, pero vamos a ajustar el loop para generar 'length' tokens NUEVOS)
-    
-    // El loop original iteraba 'length' veces.
-    // Vamos a mantener la lógica pero usando el nuevo sampleo y decoding.
-
     for i in 0..length {
-        // En el primer paso (i == 0) procesamos toda la semilla para inicializar la memoria.
-        // Después, solo procesamos el último token generado para mantener eficiencia O(1).
         let tokens_to_process = if i == 0 {
             current_tokens.clone()
         } else {
@@ -285,34 +277,31 @@ where
 
         let seq_len = tokens_to_process.len();
         let indices = Tensor::<B, 1, burn::tensor::Int>::from_data(
-            TensorData::new(tokens_to_process.iter().map(|&t| t as i32).collect(), [seq_len]),
+            TensorData::new(tokens_to_process.iter().map(|&t| t as i64).collect(), [seq_len]),
             device,
         );
 
         let input = eye.clone()
             .select(0, indices)
             .reshape([1, seq_len, vocab_size]);
-   
-        // 2. Ejecutamos el forward
-        let (output, next_state) = model.forward(input, current_state);
-        
-        // 3. Actualizamos el estado
+
+        // Usamos el nuevo forward_refine con 3 loops para mejorar la calidad
+        // "Escribe una vez (último loop), lee muchas (loops previos)"
+        let (output, next_state) = model.forward_refine(input, current_state, 1);
         current_state = Some(next_state);
 
-        // 4. Extraemos el último paso de los logits
         let dims = output.dims();
         let last_logits = output
             .slice([0..1, (dims[1] - 1)..dims[1], 0..dims[2]])
             .reshape([1, dims[2]]);
 
         // 5. Muestreo con temperatura y Top-P/ Top-K
-        // Muestreo equilibrado (Top-P 0.9 para evitar repeticiones, Temp 0.7 para fluidez)
+        // Muestreo equilibrado (Top-P 0.9 para evitar repeticiones, Temp 0.4 para fluidez)
         let next_token = sample_from_logits(last_logits, 0.4, 40, 0.9);
 
         current_tokens.push(next_token);
         generated_ids.push(next_token);
-        
-        // Efecto visual inmediato para saltos de línea
+
         if let Some(t) = tokenizer.id_to_token(next_token) {
             if t.contains('Ċ') {
                 print!("\n"); 
@@ -320,7 +309,6 @@ where
         }
     }
 
-    // 6. Decodificar solo los tokens generados (sin la semilla)
     tokenizer.decode(&generated_ids[seed_tokens.len()..])
 }
 
@@ -338,9 +326,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+
     let text_file = &args[1];
     let tokenizer_path = "tokenizer.json";
-    let model_path = "xlstm_chat_model_mlstm";
+    let model_path = "MLSTM_chat_model";
 
     // Intentar leer vocab_size de argumentos o usar 2000 por defecto
     let target_vocab_size = 1024;
@@ -368,33 +357,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Hiperparámetros - PROTECCIÓN DE RAM
     let vocab_size = tokenizer.vocab_size();
     let hidden_size = 256; // Suficiente para BPE
-    let num_layers = 1;
-    let num_blocks = 2;
+    let num_layers = 1;//let num_layers = 2;
+    let num_blocks = 2; //let num_blocks = 4;
     let output_size = vocab_size; 
-    let dropout = 0.0;
+    let dropout = 0.2;
 
-    let seq_length = 128; 
-    let batch_size = 16; 
-    let stride = 64;     // Más data por época
-    let num_epochs = 50;
+    let seq_length = 128; //32 Reducido para evitar explosión de memoria
+    let batch_size = 16; // Mucho más seguro para CPU
+    let stride = 128;     //seq_length 64 Salto igual al contexto
+    let num_epochs = 25;
     let num_heads = 4;
     // Learning rates por bloque (igual que main.rs)
     let lr_config = LearningRateConfig::per_block_type(
-        5e-4, // sLSTM learning rate
-        1e-4, // mLSTM learning rate (Very aggressive for faster convergence)
-        5e-4, // Other components learning rate
+        1e-3, // sLSTM learning rate (unused here)
+        5e-4, // mLSTM learning rate (increased to 1e-3 to learn faster now that gradients are clipped)
+        1e-3,
+        1e-3, // Other components learning rate
     );
 
     println!("Configuración del modelo:");
     println!("  Bloques: {}", num_blocks);
     println!("  Hidden size: {}", hidden_size);
     println!("  Seq length: {}", seq_length);
-    println!("  Batch size: {}", batch_size);
+    println!("  Batch size: {}", batch_size);   
     println!("  Epochs: {}\n", num_epochs);
 
     // Device
-    let device = WgpuDevice::default();
-
+   // let device = WgpuDevice::default();
+    let device = Default::default();
     // Configuración del modelo - vocab_size es el input_size (one-hot)
    // let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, output_size)
      //   .with_dropout(dropout)
@@ -406,8 +396,8 @@ fn main() -> Result<(), Box<dyn Error>> {
      let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, output_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        //.with_lstm_type(LstmType::Alternate)
-        .with_lstm_type(LstmType::MLSTM) // <--- Forzar solo mLSTM
+        .with_lstm_type(LstmType::MLSTM) 
+        .with_initializer(burn::nn::Initializer::XavierNormal { gain: 1.0 })
         .with_use_projection(true);   
 
     // Verificar si existe un modelo guardado (una sola vez)
@@ -473,28 +463,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         model.print_architecture();
         println!();
 
-        // Crear optimizador
         let mut optim = AdamConfig::new()
             .with_beta_1(0.9)
             .with_beta_2(0.999)
             .with_epsilon(1e-8)
             .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.3)))
             .init();
+
 
         println!("Iniciando entrenamiento...\n");
 
-        // Training loop - Solo procesar baches COMPLETOS para evitar errores de dimensión
-        let num_batches = num_actual_sequences / batch_size; 
+        // Training loo
+        let num_batches = num_actual_sequences.div_ceil(batch_size);
 
-         for epoch in 0..num_epochs {
+        // Initialize Loss
+        let loss_fn = CrossEntropyLossConfig::new().init(&device);
+
+        for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
             let mut num_losses = 0;
             let mut correct = 0;
             let mut total = 0;
-            let mut current_state = None;
+            let mut current_state = None; 
             for batch_idx in 0..num_batches {
-
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
                 let epoch_start = Instant::now();
@@ -502,58 +494,61 @@ fn main() -> Result<(), Box<dyn Error>> {
                     break;
                 }
 
-                // Generar batch instantáneo (usando Inner Backend para ahorrar RAM)
+                // Generar batch instantáneo (usando siempre batch_size completo para evitar panics)
                 let (input_batch, target_batch) = create_batch::<MyBackend>(
                     &tokens,
                     current_batch_start_seq * stride,
-                    current_batch_size,
+                    batch_size, // Forzar bache completo (create_batch se encarga del padding)
                     seq_length,
-                    stride, // Pass stride
                     vocab_size,
                     &device,
                 );
-                 if batch_idx == 0 {
-                // Hacemos un forward silencioso para llenar las matrices del mLSTM
-                let (_, warm_state) = model.predict_last(input_batch.clone(), None);
-                current_state = Some(warm_state);
-                println!("> Estado inicializado con éxito en el Batch 0");
-            }   
+
                 // Forward pass
                // let (logits, _) = model.forward(input_batch.clone(), None);
-               let (logits, next_state) = model.forward(input_batch.clone(), current_state);
-                current_state = Some(next_state.into_iter().map(|s| {
-    s.map(|state| state.detach())
-}).collect());
-                // --- OPTIMIZACIÓN: COSTE Y ACCURACY NATIVOS SOBRE TODA LA SECUENCIA ---
-                
-                // --- OPTIMIZACIÓN: COSTE Y ACCURACY NATIVOS SOBRE TODA LA SECUENCIA ---
-                
-                // Aplanar para cálculo eficiente
-                let logits_flat = logits.reshape::<2, _>([current_batch_size * seq_length, vocab_size]);
-                let target_flat = target_batch.reshape::<1, _>([current_batch_size * seq_length]);
-
-                // Usar inner backend para los targets para que no consuman memoria de gradientes
-                let eye_inner = Tensor::<Wgpu<f32, i32>, 2>::eye(vocab_size, &device);
-                let target_one_hot = Tensor::<MyBackend, 2>::from_inner(
-                    eye_inner.select(0, target_flat.clone().inner())
-                             .reshape([current_batch_size * seq_length, vocab_size])
+                // Forward pass
+                //let (logits, lout) = model.forward(input_batch.clone(), current_state.clone());
+                // use out pero es caro 
+               
+               if batch_idx == 0 {
+                current_state = None;
+               /* // Hacemos un forward silencioso para llenar las matrices del mLSTM
+                let (_, warm_state) = model.predict_last(input_batch.clone(), None);
+                current_state = Some(warm_state);*/
+                println!("> Estado inicializado con éxito en el Batch 0 valor none / null");
+            }
+                let (logits, next_state) = model.forward(input_batch.clone(), current_state);
+                 //    current_state = Some(next_state.clone());
+                // CRÍTICO: Detach de los estados ocultos entre batches para implementar Truncated BPTT.
+                // Si no se hace esto, el grafo de Autodiff crece infinitamente a través de toda la época
+                // causando OOM, lentitud extrema y explosión/desvanecimiento de gradientes (pérdida de memoria).
+                current_state = Some(
+                    next_state
+                        .into_iter()
+                        .map(|opt_state| opt_state.map(|s| s.detach()))
+                        .collect()
                 );
 
-                // 2. Calcular Cross-Entropy nativo sobre toda la secuencia
-                let log_probs = (softmax(logits_flat.clone(), 1) + 1e-10).log();
-                let loss_tensor = -(target_one_hot * log_probs).sum_dim(1).mean();
+                // --- OPTIMIZACIÓN: COSTE Y ACCURACY NATIVOS ---
+                
+                // Aplanar para cálculo eficiente
+                let logits_flat: Tensor<MyBackend, 2> = logits.reshape([batch_size * seq_length, vocab_size]);
+                let target_flat = target_batch.reshape::<1, _>([batch_size * seq_length]);
+
+                // Usar CrossEntropyLoss nativo de Burn (evita one-hot y es más estable)
+                let loss_tensor = loss_fn.forward(logits_flat.clone(), target_flat.clone());
                 
                 let loss_f32 = loss_tensor.clone().into_data().as_slice::<f32>().unwrap()[0];
                 total_loss += loss_f32;
                 num_losses += 1;
 
                 // 3. Calcular Accuracy nativo sobre toda la secuencia
-                let predicted_indices = logits_flat.argmax(1).reshape([current_batch_size * seq_length]);
+                let predicted_indices = logits_flat.argmax(1).reshape([batch_size * seq_length]);
                 let matches = predicted_indices.equal(target_flat);
-                let correct_batch = matches.int().sum().into_data().as_slice::<i32>().unwrap()[0];
+                let correct_batch = matches.int().sum().into_data().as_slice::<i64>().unwrap()[0];
                 
                 correct += correct_batch as usize;
-                total += current_batch_size * seq_length;
+                total += batch_size * seq_length;
 
                 // --- FIN OPTIMIZACIÓN ---
 
@@ -576,15 +571,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             if epoch % 1 == 0 {
                 println!(
-                    "Epoch [{:3}/{}], Loss: {:.4}, Accuracy (Avg): {:.2}%",
+                    "Epoch [{:3}/{}], Loss: {:.4}, Accuracy: {:.2}%",
                     epoch + 1,
                     num_epochs,
                     avg_loss,
                     accuracy
                 );
-            }
-
-            if epoch % 1 == 0 {
 
                 // GUARDADO POR ÉPOCA (ADICIONAL)
                 let recorder = CompactRecorder::new();
@@ -593,25 +585,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Generar texto de ejemplo con temperatura y SEMILLA ALEATORIA
                 if epoch % 1 == 0 {
                     use rand::Rng;
-                    let mut rng = rand::rng(); 
+                    let mut rng = rand::rng();
                     
-                    // Elegir un punto de inicio al azar para la semilla (15 tokens para contexto real)
-                    let seed_len = 15;
-                    let start_random = if tokens.len() > seed_len + 1 {
-                        rng.random_range(0..tokens.len() - seed_len - 1) 
+                    // Elegir un punto de inicio al azar para la semilla (dejando espacio para 5 tokens)
+                    let start_random = if tokens.len() > 10 {
+                        rng.random_range(0..tokens.len() - 6)
                     } else {
                         0
                     };
                     
-                    let seed_tokens: Vec<usize> = tokens[start_random..start_random + seed_len].to_vec();
-                    // Limpieza de la semilla (eliminando decoradores de BPE)
+                    let seed_tokens: Vec<usize> = tokens[start_random..start_random + 5].to_vec();
                     let seed = tokenizer.decode(&seed_tokens)
                         .replace('▁', " ")
                         .replace('Ġ', " ")
                         .replace('Ċ', "\n")
-                        .replace("  ", " "); // Quitar espacios extra que ensucian
+                        .replace("  ", " ");
                     
-                    println!("  -> Semilla ({} tokens): \"{}\"", seed_len, seed.trim());
+                    println!("  -> Generando con semilla al azar: '{}'", seed.trim());
+                    let gen_start = Instant::now();
                     let generated = generate_text(
                         &model, // Pasamos referencia sin clonar
                         &tokenizer,
@@ -620,7 +611,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         vocab_size,
                         &device,
                     );
-                    println!("  Generado: {}{}\n", seed, generated);
+                    println!("  Generado ({:.2}s): {}\n", gen_start.elapsed().as_secs_f32(), generated);
 
                     // --- LOGGER: Guardar en archivo para ver la evolución ---
                     let log_path = "training_history_mlstm.txt";
@@ -660,7 +651,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Comandos:");
     println!("  - Escribe un texto semilla y presiona Enter para generar");
     println!("  - Escribe 'salir' o 'exit' para terminar");
+    println!("  - Escribe 'len <n>' para cambiar la longitud (ej: len 300)");
     println!("  - Escribe 'auto' para generar con semilla automática\n");
+
+    let mut current_gen_length = 200;
 
     loop {
         print!("Semilla > ");
@@ -679,6 +673,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
+        if input.to_lowercase().starts_with("len ") {
+            if let Ok(new_len) = input[4..].trim().parse::<usize>() {
+                current_gen_length = new_len;
+                println!("  -> Longitud de generación cambiada a: {} tokens\n", current_gen_length);
+                continue;
+            }
+        }
+
         let seed = if input.eq_ignore_ascii_case("auto") {
             text.chars().take(20).collect::<String>()
         } else {
@@ -687,16 +689,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         println!("\n┌─ Generando texto...");
         println!("│ Semilla: {}", seed);
-        println!("└─ Longitud: 200 caracteres\n");
-
+        let gen_start = Instant::now();
         let generated = generate_text(
             &model.valid(),
             &tokenizer,
             &seed,
-            200,
+            current_gen_length,
             vocab_size,
             &device,
         );
+        let gen_elapsed = gen_start.elapsed().as_secs_f32();
+        println!("└─ Longitud: {} caracteres | Tiempo: {:.2}s\n", current_gen_length, gen_elapsed);
 
         println!("╭─────────────────────────────────────────────────────────╮");
         println!("│ TEXTO GENERADO:");
