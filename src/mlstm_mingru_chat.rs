@@ -321,8 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         1e-4, // Others
     );
 
-    println!("Configuración: {} bloques (H={})", num_blocks, hidden_size);
-    println!("Layout: {:?}", block_layout);
+ 
 
     let device = Default::default();
 
@@ -384,7 +383,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let batch_start = Instant::now();
                 let start_seq = batch_idx * batch_size;
                 let current_batch_size = batch_size.min(num_actual_sequences - start_seq);
-                if current_batch_size == 0 { break; }
+                
+                // Si el último batch no está completo, lo saltamos para evitar errores de forma (reshape/states)
+                if current_batch_size < batch_size { break; }
 
                 let (input, target) = create_batch::<MyBackend>(&tokens, start_seq * stride, current_batch_size, seq_length, stride, vocab_size, &device);
                 

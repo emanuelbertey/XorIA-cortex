@@ -261,13 +261,16 @@ where
     }
 
     let eye = Tensor::<B, 2>::eye(vocab_size, device);
+    
+    let mut current_state = None; 
     let mut current_tokens = seed_tokens.clone();
 
     for i in 0..length {
-        // Optimización: Solo tomar los últimos 4 tokens para la ventana de Convolución
-        let take_limit = 4;
-        let start_idx = current_tokens.len().saturating_sub(take_limit);
-        let tokens_to_process = current_tokens[start_idx..].to_vec();
+        let tokens_to_process = if i == 0 {
+            current_tokens.clone()
+        } else {
+            vec![*current_tokens.last().unwrap()]
+        };
 
         let seq_len = tokens_to_process.len();
         let indices = Tensor::<B, 1, burn::tensor::Int>::from_data(
@@ -279,7 +282,8 @@ where
             .select(0, indices)
             .reshape([1, seq_len, vocab_size]);
 
-        let (output, _next_state) = model.forward(input, None);
+        let (output, next_state) = model.forward(input, current_state);
+        current_state = Some(next_state);
 
         let dims = output.dims();
         let last_logits = output
@@ -320,7 +324,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let text_file = &args[1];
     let tokenizer_path = "tokenizer_mingru.json";
-    let model_path = "mingru_chat_model_conv_mlp";
+    let model_path = "mingru_chat_model_mingru";
 
     // Intentar leer vocab_size de argumentos o usar 2000 por defecto
     let target_vocab_size = 1024;
@@ -387,8 +391,6 @@ fn main() -> Result<(), Box<dyn Error>> {
      let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, output_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_use_conv(true)
-        .with_use_mlp(true)
         //.with_lstm_type(LstmType::Alternate)
         .with_lstm_type(LstmType::MINGRU) //::SLSTM ::SLSTM<--- Forzar solo mLSTM
         .with_use_projection(true);   
@@ -575,12 +577,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     
                     println!("  -> Generando con semilla al azar: '{}'", seed.trim());
                     let gen_start = Instant::now();
-                    let model_valid = model.valid();
                     let generated = generate_text(
-                        &model_valid, 
+                        &model, // Pasamos referencia sin clonar
                         &tokenizer,
                         &seed,
-                        100, // Generar 100 caracteres
+                        100, // Generar 100 palabras para ver la capacidad real
                         vocab_size,
                         &device,
                     );

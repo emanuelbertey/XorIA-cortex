@@ -30,8 +30,8 @@ use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
 use tokenizers::tokenizer::Tokenizer as HFTokenizer;
 use tokenizers::models::TrainerWrapper;
-
-use xlstm::{LearningRateConfig, LstmType, XLstm, XLstmconfig};
+use xlstm::{LearningRateConfig, LstmType, XLstm, XLstmconfig, BlockType};
+use std::collections::HashSet;
 
 type MyBackend = Autodiff<NdArray<f32>>;
 
@@ -48,14 +48,14 @@ impl Tokenizer {
             .map_err(|e| format!("Error building BPE: {}", e))?;
             
         let mut tokenizer = HFTokenizer::new(model);
-        // ByteLevel preserva exactamente todos los caracteres (espacios, tabs, saltos)
         tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
         tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
 
         let trainer = BpeTrainerBuilder::default()
             .show_progress(true)
             .vocab_size(vocab_size)
-            .min_frequency(2)
+            .min_frequency(0)
+            .initial_alphabet(ByteLevel::alphabet().into_iter().collect::<HashSet<_>>())
             .build();
 
         let mut trainer_wrapper = TrainerWrapper::from(trainer);
@@ -228,6 +228,11 @@ where
 
     probs_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
+    // Check for NaNs
+    if probs_vec.iter().any(|(_, p)| p.is_nan()) {
+        return 0; // Fallback safety
+    }
+
     let k = top_k.min(probs_vec.len()).max(1);
     let mut filtered_probs: Vec<(usize, f32)> = Vec::with_capacity(k);
     
@@ -291,6 +296,8 @@ where
         );
 
         let input = eye.clone().select(0, indices).reshape([1, seq_len, vocab_size]);
+        
+        //        let (output, next_state) = model.forward(input, current_state);// Usamos la nueva función independiente para refinamiento en generación
         let (output, next_state) = model.forward(input, current_state);
         current_state = Some(next_state);
 
@@ -320,7 +327,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_path = Path::new(&args[1]);
     let tokenizer_path = "tokenizer_pro.json";
     let model_path = "xlstm_pro_model";
-    let extensions = ["txt", "gd", /*"html", "cpp", "c", "py", "h",*/ "md", "gdshader"];
+    let extensions = ["txt", "gd", /*"html", "cpp", "c", "py", "h","md", */ "gdshader"];
 
     let all_files = if input_path.is_dir() {
         println!("Explorando directorio: {:?}", input_path);
@@ -335,40 +342,66 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Archivos encontrados: {}", all_files.len());
 
     let target_vocab_size = 2048;
-    let tokenizer = if Path::new(tokenizer_path).exists() {
+    let tokenizer_file = Path::new(tokenizer_path);
+    let tokenizer = if tokenizer_file.exists() && fs::metadata(tokenizer_file).map(|m| m.len()).unwrap_or(0) > 5000 {
         Tokenizer::load(tokenizer_path)?
     } else {
-        println!("Entrenando nuevo tokenizador con muestras...");
+        println!("Entrenando nuevo tokenizador con {} archivos...", all_files.len().min(100));
         let mut sample_text = String::new();
-        for file_path in all_files.iter().take(5) {
+        for file_path in all_files.iter().take(100) {
             if let Ok(content) = fs::read_to_string(file_path) {
-                let short_content: String = content.chars().take(20000).collect();
-                sample_text.push_str(&short_content);
+                sample_text.push_str(&content.chars().take(10000).collect::<String>());
             }
         }
+        if sample_text.trim().len() < 100 {
+            return Err("Error: Muestras insuficientes para entrenar el tokenizador. Revisa la ruta.".into());
+        }
+        println!("  -> Bytes totales para entrenamiento: {}", sample_text.len());
         let tokenizer = Tokenizer::from_text(&sample_text, target_vocab_size)?;
         tokenizer.save(tokenizer_path)?;
         tokenizer
     };
 
     let vocab_size = tokenizer.vocab_size();
-    let hidden_size = 320;
+    println!("Resumen: Vocabulario={}, Archivos={}", vocab_size, all_files.len());
+    
+    let hidden_size = 512;
     let num_layers = 1;
-    let num_blocks = 4;
-    let seq_length = 320;
-    let batch_size = 16;
-    let stride = 320;
+    let seq_length = 256;
+    let batch_size = 10;
+    let stride = 256;
     let num_epochs = 50;
 
     let device = Default::default();
     let dropout = 0.1;
-    let num_heads = 4;
+    let num_heads = 8;
+
+    // DEFINICIÓN DEL ORDEN DE BLOQUES
+    let block_layout = vec![
+       BlockType::MLSTM, 
+        BlockType::MLSTM, 
+        BlockType::MLSTM, 
+        BlockType::MLSTM, 
+        BlockType::MLSTM,
+        BlockType::MLSTM, 
+    ];
+    let num_blocks = block_layout.len();
+
+    let lr_config = LearningRateConfig::per_block_type(
+        1e-4, // sLSTM
+        6e-4, // mLSTM
+        1e-3, // minGRU
+        1e-4, // Others
+    );
 
     let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::MLSTM)
+        .with_lstm_type(LstmType::Custom(block_layout.clone()))
         .with_use_projection(true);   
+
+    println!("Configuración: {} bloques (H={})", num_blocks, hidden_size);
+    println!("Layout: {:?}", block_layout);
 
     let model_file = format!("{}.mpk", model_path);
     let mut model = if Path::new(&model_file).exists() {
@@ -433,7 +466,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .replace('Ġ', " ")
                 .replace('Ċ', "\n")
                 .replace('↲', "\n")
-                .replace('␣', " ");
+                .replace('␣', " ")
+                .replace('\t', "    "); // Convertir tabs a espacios para la consola
             
             // Si el texto parece vacío pero hay tokens, es que son solo espacios/control
             if clean_text.trim().is_empty() && !generated.is_empty() {
@@ -473,7 +507,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
     let loss_fn = CrossEntropyLossConfig::new().init(&device);
-    let lr_config = LearningRateConfig::per_block_type(1e-3, 1e-3, 1e-3, 1e-3);
 
     println!("\nIniciando entrenamiento por fragmentos...");
 
@@ -494,10 +527,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 io::stdout().flush().unwrap();
             }
 
-            let fragments = FileFragmentIterator::new(file_path, 64).map_err(|e| e.to_string())?;
+            let fragments = FileFragmentIterator::new(file_path, 4).map_err(|e| e.to_string())?;
             
             for (_fr_idx, fragment) in fragments.enumerate() {
-                token_buffer.extend(tokenizer.encode(&fragment));
+                let new_tokens = tokenizer.encode(&fragment);
+                if new_tokens.is_empty() && !fragment.trim().is_empty() {
+                    eprintln!("\n⚠️ ADVERTENCIA: Fragmento produjo 0 tokens. ¿Tokenizador roto?");
+                }
+                token_buffer.extend(new_tokens);
 
                 // Procesamos mientras el búfer tenga suficientes tokens para al menos un batch completo
                 while token_buffer.len() >= tokens_needed_for_batch + 1 {
@@ -527,7 +564,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let clean_debug = decoded
                                 .replace('▁', " ")
                                 .replace('Ġ', " ")
-                                .replace('Ċ', "\n");
+                                .replace('Ċ', "\n")
+                                .replace('\t', "    ");
                             
                             println!("SEQ {}:", b_idx);
                             println!("--------------------------------------------------");
@@ -558,7 +596,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("    🔍 Generando muestra de prueba:");
                         let seed = "func _ready():";
                         let start_gen = Instant::now();
-                        let generated = generate_text(&model, &tokenizer, seed, 200, vocab_size, &device);
+                        let generated = generate_text(&model.valid(), &tokenizer, seed, 200, vocab_size, &device);
                         let elapsed_gen = start_gen.elapsed().as_secs_f32();
                         println!("    ✨ Generado en {:.3}s:", elapsed_gen);
                         
@@ -566,7 +604,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let clean_text = full_text
                             .replace('▁', " ")
                             .replace('Ġ', " ")
-                            .replace('Ċ', "\n");
+                            .replace('Ċ', "\n")
+                            .replace('\t', "    ");
 
                         println!("    ┌──────────────────────────────────────────────────");
                         for line in clean_text.lines() {
@@ -578,6 +617,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
+            // --- FIX: Separador entre archivos para evitar que se peguen las palabras ---
+            token_buffer.extend(tokenizer.encode("\n")); 
         }
         println!("\n  ✅ Época finalizada. Guardando...");
         let recorder = CompactRecorder::new();
