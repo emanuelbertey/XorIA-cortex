@@ -1,0 +1,53 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.bin_name }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        bin_name: [mingruchat, slstmchat, xlstmchat, mlstmchat1]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust Cache
+      uses: swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.bin_name }}-${{ matrix.os }}
+
+    - name: Build Binary
+      run: cargo build --release --bin ${{ matrix.bin_name }}
+
+    - name: Prepare Artifact Path (Unix)
+      if: runner.os != 'Windows'
+      run: |
+        mkdir -p artifacts
+        cp target/release/${{ matrix.bin_name }} artifacts/
+        
+    - name: Prepare Artifact Path (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        mkdir artifacts
+        copy target\release\${{ matrix.bin_name }}.exe artifacts\
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.bin_name }}-${{ runner.os }}
+        path: artifacts/*

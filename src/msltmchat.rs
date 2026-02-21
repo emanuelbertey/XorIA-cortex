@@ -369,7 +369,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vocab_size = tokenizer.vocab_size();
     let hidden_size = 256; // Suficiente para BPE
     let num_layers = 1;
-    let num_blocks = 1;
+    let num_blocks = 2;
     let output_size = vocab_size; 
     let dropout = 0.0;
 

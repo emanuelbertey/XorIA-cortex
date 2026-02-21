@@ -62,6 +62,14 @@ The training was manually stopped at **epoch 13** of the current run (adding up 
 ### Focus on Grammatical Quality over Memorization
 While the model could have continued training for even lower loss and higher accuracy, it was decided to stop at 30 epochs to avoid **overfitting**. The priority is to achieve high **grammatical quality** with a touch of creative hallucination, ensuring the model generates completely correct structures without making up non-existent words, rather than simply memorizing the dataset verbatim. 
 
+### The sLSTM Breakthrough: Superior Accuracy & Convergence
+
+In recent experiments with the **sLSTM architecture**, we observed a massive performance leap. Even at early stages, sLSTM significantly outperformed the mLSTM variants:
+
+*   **Epoch 30 (Significant Benchmark)**: Already reached **89.43% Accuracy** and **0.4225 Loss**, far surpassing the mLSTM's performance at the same stage.
+*   **Epoch 50 (Final Result)**: Reached a staggering **96.73% Accuracy** and **0.12 Loss**.
+*   **Performance**: The sLSTM demonstrated a much faster and more stable learning curve, achieving near-perfect coherence compared to previous architectures.
+
 ---
 
 <a name="español"></a>
@@ -126,6 +134,14 @@ El entrenamiento se detuvo manualmente en la **época 13** de la ejecución actu
 
 ### Prioridad a la Calidad Gramatical sobre la Memorización
 Aunque el modelo estaba en condiciones de seguir mejorando sus métricas, se decidió detener el entrenamiento a las 30 épocas para no entrar en **overfitting** (sobreajuste). El objetivo priorizado fue mantener la **calidad gramatical** y permitir cierta "alucinación" creativa, siendo muy correcto sintácticamente y sin inventar palabras, evitando así que el modelo simplemente memorizara el dataset.
+
+### El Gran Avance de sLSTM: Precisión Superior y Convergencia
+
+En pruebas recientes con la **arquitectura sLSTM**, observamos un salto masivo de rendimiento. Incluso en etapas tempranas, sLSTM superó significativamente a las variantes mLSTM:
+
+*   **Época 30 (Hito Significativo)**: Ya alcanzaba el **89.43% de Precisión** y **0.4225 de Pérdida**, superando por mucho el rendimiento de mLSTM en la misma etapa.
+*   **Época 50 (Resultado Final)**: Alcanzó un asombroso **96.73% de Precisión** y **0.12 de Pérdida**.
+*   **Rendimiento**: sLSTM demostró una curva de aprendizaje mucho más rápida y estable, logrando una coherencia casi perfecta en comparación con arquitecturas anteriores.
 
 ## License / Licencia
 
