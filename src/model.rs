@@ -288,6 +288,46 @@ impl<B: Backend> XLstm<B> {
         (output, hidden_states)
     }
 
+    /// Optimized forward pass for text generation with per-block refinement
+    pub fn forward_refine(
+        &self,
+        input_seq: Tensor<B, 3>,
+        states: Option<alloc::vec::Vec<Option<LSTMState<B>>>>,
+        n_loops: usize,
+    ) -> (Tensor<B, 3>, alloc::vec::Vec<Option<LSTMState<B>>>)
+    where
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
+    {
+        // Apply input projection if present
+        let mut x = if let Some((linear, norm, dropout)) = &self.input_projection {
+            let mut x = linear.forward(input_seq);
+            x = norm.forward(x);
+            dropout.forward(x)
+        } else {
+            input_seq
+        };
+
+        // Initialize states if not provided
+        let mut hidden_states = states.unwrap_or_else(|| alloc::vec![None; self.num_blocks]);
+
+        // Pass through blocks with refinement
+        for (i, block) in self.blocks.iter().enumerate() {
+            let old_state = hidden_states[i].take();
+            let (output, new_state) = block.forward_refine(x, old_state, n_loops);
+            x = output;
+            hidden_states[i] = new_state;
+        }
+
+        // Apply output head
+        let (linear1, dropout, linear2) = &self.output_head;
+        let mut x = linear1.forward(x);
+        x = activation::gelu(x);
+        x = dropout.forward(x);
+        let output = linear2.forward(x);
+
+        (output, hidden_states)
+    }
+
     /// Forward pass returning only the last timestep prediction
     ///
     /// # Arguments

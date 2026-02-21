@@ -1,78 +1,99 @@
-/*!
-# xLSTM Block Implementation
-
-This module implements the xLSTM block as described in the paper:
-"xLSTM: Extended Long Short-Term Memory" by Beck et al. (2024).
-
-The xLSTM block combines either sLSTM or mLSTM with layer normalization,
-residual connections, and additional linear projections.
-*/
-
 use burn::{
-    config::Config,
     module::Module,
     nn::{
-        conv::{Conv1d, Conv1dConfig},
-        Dropout, DropoutConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig,
-        PaddingConfig1d,
+        conv::{Conv2d, Conv2dConfig},
+        Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Initializer,
     },
-    tensor::{activation, backend::Backend, Tensor},
+    tensor::{backend::Backend, Tensor, activation},
+    config::Config,
 };
+use crate::slstm::{SLstm, SLstmstate, SLstmconfig};
+use crate::mlstm::{MLstm, MLstmstate, MLstmconfig};
+use crate::mingru::{MinGru, MinGruState, MinGruConfig};
 use serde::{Deserialize, Serialize};
 
-use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate, MinGru, MinGruConfig, MinGruState};
-
-/// Type of LSTM block
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BlockType {
-    /// Scalar LSTM
     SLSTM,
-    /// Matrix LSTM
     MLSTM,
-    /// Minimal GRU
     MINGRU,
 }
 
-/// Configuration for xLSTM block
+#[derive(Module, Debug)]
+pub enum LSTMVariant<B: Backend> {
+    SLSTM(SLstm<B>),
+    MLSTM(MLstm<B>),
+    MINGRU(MinGru<B>),
+}
+
+#[derive(Clone, Debug)]
+pub enum LSTMState<B: Backend> {
+    SLSTM(alloc::vec::Vec<SLstmstate<B, 2>>),
+    MLSTM(alloc::vec::Vec<MLstmstate<B>>),
+    MINGRU(alloc::vec::Vec<MinGruState<B>>),
+}
+
+impl<B: Backend> LSTMState<B> {
+    pub fn detach(self) -> Self {
+        match self {
+            Self::SLSTM(states) => Self::SLSTM(states.into_iter().map(|s| s.detach()).collect()),
+            Self::MLSTM(states) => Self::MLSTM(states.into_iter().map(|s| s.detach()).collect()),
+            Self::MINGRU(states) => Self::MINGRU(states.into_iter().map(|s| s.detach()).collect()),
+        }
+    }
+}
+
 #[derive(Config, Debug)]
 pub struct XLstmblockConfig {
-    /// Input size
-    pub input_size: usize,
-    /// Hidden size
-    pub hidden_size: usize,
-    /// Number of layers
+    pub d_input: usize,
+    pub d_hidden: usize,
     pub num_layers: usize,
-    /// Number of heads for multi-head mLSTM
+    pub block_type: BlockType,
     #[config(default = "4")]
     pub num_heads: usize,
-    /// Dropout probability
     #[config(default = "0.0")]
     pub dropout: f64,
-    /// Block type (sLSTM or mLSTM)
-    pub block_type: BlockType,
-    /// Weight initializer
-    #[config(default = "Initializer::XavierNormal{gain:0.0}")]
-    pub initializer: Initializer,
-    /// Whether to use Causal Conv1D preprocessing
     #[config(default = "false")]
     pub use_conv: bool,
-    /// Size of the Convolution kernel
     #[config(default = "4")]
     pub conv_kernel_size: usize,
-    /// Whether to append an MLP mapping function
     #[config(default = "false")]
     pub use_mlp: bool,
+    #[config(default = "Initializer::XavierNormal{gain:1.0}")]
+    pub initializer: Initializer,
 }
 
 impl XLstmblockConfig {
-    /// Initialize a new xLSTM block
     pub fn init<B: Backend>(&self, device: &B::Device) -> XLstmblock<B> {
-        let conv = if self.use_conv && self.conv_kernel_size > 0 {
-            let pad = self.conv_kernel_size.saturating_sub(1);
+        let lstm = match self.block_type {
+            BlockType::SLSTM => LSTMVariant::SLSTM(
+                SLstmconfig::new(self.d_input, self.d_hidden, self.num_layers)
+                    .with_initializer(self.initializer.clone())
+                    .init(device),
+            ),
+            BlockType::MLSTM => LSTMVariant::MLSTM(
+                MLstmconfig::new(self.d_input, self.d_hidden, self.num_layers)
+                    .with_num_heads(self.num_heads)
+                    .with_dropout(self.dropout)
+                    .with_initializer(self.initializer.clone())
+                    .init(device),
+            ),
+            BlockType::MINGRU => LSTMVariant::MINGRU(
+                MinGruConfig::new(self.d_input, self.d_hidden, self.num_layers)
+                    .with_initializer(self.initializer.clone())
+                    .init(device),
+            ),
+        };
+
+        let norm = LayerNormConfig::new(self.d_hidden).init(device);
+        let proj = LinearConfig::new(self.d_hidden, self.d_hidden)
+            .with_initializer(self.initializer.clone())
+            .init(device);
+
+        let conv = if self.use_conv {
             Some(
-                Conv1dConfig::new(self.input_size, self.input_size, self.conv_kernel_size)
-                    .with_padding(PaddingConfig1d::Explicit(pad))
-                    .with_groups(self.input_size)
+                Conv2dConfig::new([self.d_input, self.d_input], [1, self.conv_kernel_size])
+                    .with_padding(burn::nn::PaddingConfig2d::Explicit(0, self.conv_kernel_size - 1))
                     .init(device),
             )
         } else {
@@ -80,144 +101,62 @@ impl XLstmblockConfig {
         };
 
         let (mlp_fc1, mlp_fc2) = if self.use_mlp {
-            let hidden_dim = self.input_size * 4;
-            (
-                Some(LinearConfig::new(self.input_size, hidden_dim).init(device)),
-                Some(LinearConfig::new(hidden_dim, self.input_size).init(device)),
-            )
+            let fc1 = LinearConfig::new(self.d_hidden, self.d_hidden * 4)
+                .with_initializer(self.initializer.clone())
+                .init(device);
+            let fc2 = LinearConfig::new(self.d_hidden * 4, self.d_hidden)
+                .with_initializer(self.initializer.clone())
+                .init(device);
+            (Some(fc1), Some(fc2))
         } else {
             (None, None)
         };
 
-        let norm = LayerNormConfig::new(self.hidden_size).init(device);
-        let dropout = DropoutConfig::new(self.dropout).init();
-        let proj = LinearConfig::new(self.hidden_size, self.input_size).init(device);
-
-        match self.block_type {
-            BlockType::SLSTM => {
-                let lstm: SLstm<B> =
-                    SLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
-                        .with_dropout(self.dropout)
-                        .with_initializer(self.initializer.clone())
-                        .init(device);
-
-                XLstmblock { lstm: LSTMVariant::SLSTM(lstm), norm, dropout, proj, conv, mlp_fc1, mlp_fc2 }
-            }
-            BlockType::MLSTM => {
-                let lstm: MLstm<B> =
-                    MLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
-                        .with_num_heads(self.num_heads)
-                        .with_dropout(self.dropout)
-                        .with_initializer(self.initializer.clone())
-                        .init(device);
-
-                XLstmblock { lstm: LSTMVariant::MLSTM(lstm), norm, dropout, proj, conv, mlp_fc1, mlp_fc2 }
-            }
-            BlockType::MINGRU => {
-                let gru: MinGru<B> =
-                    MinGruConfig::new(self.input_size, self.hidden_size, self.num_layers)
-                        .with_dropout(self.dropout)
-                        .with_initializer(self.initializer.clone())
-                        .init(device);
-
-                XLstmblock { lstm: LSTMVariant::MINGRU(gru), norm, dropout, proj, conv, mlp_fc1, mlp_fc2 }
-            }
+        XLstmblock {
+            lstm,
+            norm,
+            proj,
+            mlp_fc1,
+            mlp_fc2,
+            conv,
+            dropout: DropoutConfig::new(self.dropout).init(),
+            hidden_size: self.d_hidden,
         }
     }
 }
 
-/// Enum to hold either sLSTM or mLSTM
-#[derive(Module, Debug)]
-pub enum LSTMVariant<B: Backend> {
-    /// Scalar LSTM variant
-    SLSTM(SLstm<B>),
-    /// Matrix LSTM variant
-    MLSTM(MLstm<B>),
-    /// Minimal GRU variant
-    MINGRU(MinGru<B>),
-}
-
-/// Enum for holding either sLSTM or mLSTM states
-#[derive(Debug, Clone)]
-pub enum LSTMState<B: Backend> {
-    /// States for sLSTM
-    SLSTM(alloc::vec::Vec<SLstmstate<B, 2>>),
-    /// States for mLSTM
-    MLSTM(alloc::vec::Vec<MLstmstate<B>>),
-    /// States for minGRU
-    MINGRU(alloc::vec::Vec<MinGruState<B>>),
-}
-
-impl<B: Backend> LSTMState<B> {
-    /// Detach the state from the computational graph
-    pub fn detach(self) -> Self {
-        match self {
-            LSTMState::SLSTM(states) => {
-                LSTMState::SLSTM(states.into_iter().map(|s| s.detach()).collect())
-            }
-            LSTMState::MLSTM(states) => {
-                LSTMState::MLSTM(states.into_iter().map(|s| s.detach()).collect())
-            }
-            LSTMState::MINGRU(states) => {
-                LSTMState::MINGRU(states.into_iter().map(|s| s.detach()).collect())
-            }
-        }
-    }
-}
-
-/// xLSTM block combining LSTM with normalization and projections
 #[derive(Module, Debug)]
 pub struct XLstmblock<B: Backend> {
-    /// LSTM variant (sLSTM or mLSTM)
     pub lstm: LSTMVariant<B>,
-    /// Layer normalization
     pub norm: LayerNorm<B>,
-    /// Dropout layer
-    pub dropout: Dropout,
-    /// Projection layer
     pub proj: Linear<B>,
-    /// Optional Causal Conv1D block
-    pub conv: Option<Conv1d<B>>,
-    /// Optional MLP First Linear
     pub mlp_fc1: Option<Linear<B>>,
-    /// Optional MLP Second Linear
     pub mlp_fc2: Option<Linear<B>>,
+    pub conv: Option<Conv2d<B>>,
+    pub dropout: Dropout,
+    pub hidden_size: usize,
 }
 
 impl<B: Backend> XLstmblock<B> {
     /// Forward pass through xLSTM block
-    ///
-    /// # Arguments
-    /// * `input_seq` - Input tensor [`batch_size`, `seq_length`, `input_size`]
-    /// * `state` - Optional initial state
-    ///
-    /// # Returns
-    /// * Output tensor [`batch_size`, `seq_length`, `input_size`]
-    /// * Final state
     pub fn forward(
         &self,
         input_seq: Tensor<B, 3>,
         state: Option<LSTMState<B>>,
     ) -> (Tensor<B, 3>, Option<LSTMState<B>>)
     where
-        <B as Backend>::FloatElem: num_traits::ToPrimitive,
-        B: Backend<FloatElem: num_traits::FromPrimitive>,
+        <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
+        B: Backend,
     {
         let mut conv_in = input_seq.clone();
         
         if let Some(conv) = &self.conv {
-            let seq_len = conv_in.dims()[1];
-            let mut x_conv = conv_in.swap_dims(1, 2);
+            let [b, s, c] = conv_in.dims();
+            let mut x_conv = conv_in.swap_dims(1, 2).reshape([b, c, 1, s]);
             x_conv = conv.forward(x_conv);
-            
-            let b = x_conv.dims()[0];
-            let c = x_conv.dims()[1];
-            
-            x_conv = x_conv.slice([0..b, 0..c, 0..seq_len]);
+            x_conv = x_conv.slice([0..b, 0..c, 0..1, 0..s]);
             x_conv = activation::gelu(x_conv);
-            
-            // Swap back
-            conv_in = x_conv.swap_dims(1, 2);
+            conv_in = x_conv.reshape([b, c, s]).swap_dims(1, 2);
         }
 
         let (mut out, new_state) = match (&self.lstm, state) {
@@ -235,7 +174,7 @@ impl<B: Backend> XLstmblock<B> {
             }
             (LSTMVariant::MLSTM(lstm), _) => {
                 let (o, ns) = lstm.forward(&conv_in, None);
-                (o, Some(LSTMState::MLSTM(ns)))
+                (o, Some(LSTMState::MLSTM(ns)))//forward_ext
             }
             (LSTMVariant::MINGRU(gru), Some(LSTMState::MINGRU(s))) => {
                 let (o, ns) = gru.forward(conv_in.clone(), Some(s));
@@ -263,7 +202,83 @@ impl<B: Backend> XLstmblock<B> {
         (out, new_state)
     }
 
-    /// Get the block type
+    /// Refined forward pass with internal loops (Loop-RNN)
+    pub fn forward_refine(
+        &self,
+        input_seq: Tensor<B, 3>,
+        state: Option<LSTMState<B>>,
+        n_loops: usize,
+    ) -> (Tensor<B, 3>, Option<LSTMState<B>>)
+    where
+        <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
+        B: Backend,
+    {
+        // Pre-procesamiento: Convolución (igual que en forward)
+        let mut conv_in = input_seq.clone();
+        if let Some(conv) = &self.conv {
+            let [b, s, c] = conv_in.dims();
+            let mut x_conv = conv_in.swap_dims(1, 2).reshape([b, c, 1, s]);
+            x_conv = conv.forward(x_conv);
+            x_conv = x_conv.slice([0..b, 0..c, 0..1, 0..s]);
+            x_conv = activation::gelu(x_conv);
+            conv_in = x_conv.reshape([b, c, s]).swap_dims(1, 2);
+        }
+
+        let mut out = conv_in; // Empezamos el loop con la señal convolucionada
+        let mut current_state = state;
+        
+        for i in 0..n_loops {
+            let is_last = i == n_loops - 1;
+            let frozen = !is_last;
+            
+            // Re-aplicar el procesamiento del bloque pero con control de congelación
+            let (next_out, next_state) = match (&self.lstm, current_state.clone()) {
+                (LSTMVariant::SLSTM(lstm), Some(LSTMState::SLSTM(s))) => {
+                    let (o, ns) = lstm.forward_ext(&out, Some(s), frozen);
+                    (o, Some(LSTMState::SLSTM(ns)))
+                }
+                (LSTMVariant::SLSTM(lstm), _) => {
+                    let (o, ns) = lstm.forward_ext(&out, None, frozen);
+                    (o, Some(LSTMState::SLSTM(ns)))
+                }
+                (LSTMVariant::MLSTM(lstm), Some(LSTMState::MLSTM(s))) => {
+                    let (o, ns) = lstm.forward_ext(&out, Some(s), frozen);
+                    (o, Some(LSTMState::MLSTM(ns)))
+                }
+                (LSTMVariant::MLSTM(lstm), _) => {
+                    let (o, ns) = lstm.forward_ext(&out, None, frozen);
+                    (o, Some(LSTMState::MLSTM(ns)))
+                }
+                (LSTMVariant::MINGRU(gru), Some(LSTMState::MINGRU(s))) => {
+                    let (o, ns) = gru.forward_ext(out.clone(), Some(s), frozen);
+                    (o, Some(LSTMState::MINGRU(ns)))
+                }
+                (LSTMVariant::MINGRU(gru), _) => {
+                    let (o, ns) = gru.forward_ext(out.clone(), None, frozen);
+                    (o, Some(LSTMState::MINGRU(ns)))
+                }
+            };
+            
+            // Post-procesamiento
+            let mut final_out = self.norm.forward(next_out);
+            final_out = activation::gelu(final_out);
+            final_out = self.proj.forward(final_out);
+            
+            if let (Some(fc1), Some(fc2)) = (&self.mlp_fc1, &self.mlp_fc2) {
+                let mlp_hid = fc1.forward(final_out.clone());
+                let mlp_hid = activation::gelu(mlp_hid);
+                final_out = final_out + fc2.forward(mlp_hid);
+            }
+            
+            out = self.dropout.forward(final_out); 
+            // Residual connection: se añade al final de cada loop sobre el input original del bloque
+            out = out + input_seq.clone();
+            current_state = next_state;
+        }
+        
+        (out, current_state)
+    }
+
     pub const fn get_type(&self) -> BlockType {
         match &self.lstm {
             LSTMVariant::SLSTM(_) => BlockType::SLSTM,

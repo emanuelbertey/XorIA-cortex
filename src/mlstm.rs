@@ -72,7 +72,7 @@ pub struct MLstmconfig {
     #[config(default = "0.0")]
     pub dropout: f64,
     /// Weight initializer
-    #[config(default = "Initializer::XavierNormal{gain:1.0}")]
+    #[config(default = "Initializer::XavierNormal{gain:0.1}")]
     pub initializer: Initializer,
 }
 impl MLstmconfig {
@@ -132,7 +132,20 @@ impl<B: Backend> MLstm<B> {
         states: Option<alloc::vec::Vec<MLstmstate<B>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<MLstmstate<B>>)
     where
-        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive + Copy,
+    {
+        self.forward_ext(input_seq, states, false)
+    }
+
+    /// Extended forward pass with  freezing support
+    pub fn forward_ext(
+        &self,
+        input_seq: &Tensor<B, 3>,
+        states: Option<alloc::vec::Vec<MLstmstate<B>>>,
+        frozen: bool,
+    ) -> (Tensor<B, 3>, alloc::vec::Vec<MLstmstate<B>>)
+    where
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive + Copy,
     {
         let device = input_seq.device();
         let [batch_size, _seq_length, _] = input_seq.dims();
@@ -142,15 +155,11 @@ impl<B: Backend> MLstm<B> {
         let mut layer_input = input_seq.clone();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // mLSTM processes the entire sequence using the parallel kernel (Dual Form)
             let old_state = hidden_states[layer_idx].clone();
+            let (h_seq, new_state) = layer.forward_sequence_ext(&layer_input, old_state, frozen);
             
-            let (h_seq, new_state) = layer.forward_sequence(&layer_input, old_state);
-            
-            // Store the final state for future sequences (re-injecting continuity)
             hidden_states[layer_idx] = new_state;
 
-            // Inter-layer Dropout
             layer_input = if layer_idx < self.num_layers - 1 && self.dropout > 0.0 {
                 self.dropout_layer.forward(h_seq)
             } else {
@@ -260,6 +269,18 @@ impl<B: Backend> MLstmcell<B> {
         &self,
         input_seq: &Tensor<B, 3>,
         state: MLstmstate<B>,
+    ) -> (Tensor<B, 3>, MLstmstate<B>)
+    where
+        <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
+    {
+        self.forward_sequence_ext(input_seq, state, false)
+    }
+
+    pub fn forward_sequence_ext(
+        &self,
+        input_seq: &Tensor<B, 3>,
+        state: MLstmstate<B>,
+        frozen: bool,
     ) -> (Tensor<B, 3>, MLstmstate<B>)
     where
         <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
@@ -427,21 +448,31 @@ impl<B: Backend> MLstmcell<B> {
         
         // 2. n_T = exp(F_T - m_T) * n_0 + sum_k (weights[T, k] * k_k)
         let last_scale = initial_scale.slice([0..batch_size, 0..self.num_heads, last_idx..seq_len, 0..1]).reshape::<3, _>([batch_size, self.num_heads, 1]);
-        let n_initial_contrib = state.normalizer * last_scale.clone().expand([batch_size, self.num_heads, head_dim]);
+        let n_initial_contrib = state.normalizer.clone() * last_scale.clone().expand([batch_size, self.num_heads, head_dim]);
         
         let last_weights = weights.slice([0..batch_size, 0..self.num_heads, last_idx..seq_len, 0..seq_len]); 
         let n_parallel_contrib = last_weights.clone().matmul(k.clone()).reshape::<3, _>([batch_size, self.num_heads, head_dim]);
         let final_norm = n_initial_contrib + n_parallel_contrib;
 
         // 3. C_T = exp(F_T - m_T) * C_0 + sum_k (weights[T, k] * v_k @ k_k^T)
-        let c_initial_contrib = state.cell * last_scale.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]);
+        let c_initial_contrib = state.cell.clone() * last_scale.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]);
         
         // sum_k weights[T, k] * (v_k @ k_k^T) --> (v_weighted^T @ k)
         let v_weighted = v * last_weights.reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]);
         let c_parallel_contrib = v_weighted.swap_dims(2, 3).matmul(k); 
         let final_cell = c_initial_contrib + c_parallel_contrib;
 
-        (h_seq.clone(), MLstmstate::new(final_cell, h_seq.slice([0..batch_size, last_idx..seq_len, 0..self.hidden_size]).reshape([batch_size, self.hidden_size]), final_norm, final_m))
+        let final_state = if frozen { 
+            state 
+        } else { 
+            MLstmstate::new(
+                final_cell, 
+                h_seq.clone().slice([0..batch_size, last_idx..last_idx+1, 0..self.hidden_size]).reshape([batch_size, self.hidden_size]), 
+                final_norm, 
+                final_m
+            ) 
+        };
+        (h_seq, final_state)
     }
 // no se usa no usarlo 
     fn get_causal_mask(&self, seq_len: usize, device: &B::Device) -> Tensor<B, 4, burn::tensor::Bool> {
@@ -451,6 +482,78 @@ impl<B: Backend> MLstmcell<B> {
         col_indices.greater(row_indices).reshape::<4, _>([1, 1, seq_len, seq_len])
     }
 //
+    /// Forward pass through mLSTM cell with optional state freezing
+    pub fn forward_step(
+        &self,
+        input: &Tensor<B, 2>,
+        state: MLstmstate<B>,
+        frozen: bool,
+    ) -> (Tensor<B, 2>, MLstmstate<B>)
+    where
+        <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
+    {
+        let cell = state.cell.clone();
+        let normalizer = state.normalizer.clone();
+        let max_gate_log = state.max_gate_log.clone();
+        let [batch_size, _] = input.dims();
+        let head_dim = self.hidden_size / self.num_heads;
+
+        // Gates calculation
+        let gates = input.clone().matmul(self.weight_ih.val().transpose())
+            + self.bias.val().reshape::<2, _>([1, 3 * self.num_heads]);
+
+        let chunks = gates.chunk(3, 1);
+        let i_log = chunks[0].clone().reshape::<2, _>([batch_size, self.num_heads]);
+        let f_log = chunks[1].clone().reshape::<2, _>([batch_size, self.num_heads]);
+        let o_gate = activation::sigmoid(chunks[2].clone()).reshape::<3, _>([batch_size, self.num_heads, 1]);
+
+        // Projections
+        let q = self.w_q.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
+        let k = self.w_k.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
+        let v = self.w_v.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, head_dim, 1]);
+
+        let m_t_minus_1 = max_gate_log.clone().reshape::<2, _>([batch_size, self.num_heads]); 
+        let m_t = if frozen { m_t_minus_1.clone() } else { (f_log.clone() + m_t_minus_1.clone()).max_pair(i_log.clone()) };
+        
+        let f_stable = (f_log + m_t_minus_1 - m_t.clone()).exp();
+        let i_stable = (i_log - m_t.clone()).exp();
+        
+        // --- Cálculo de C y N ---
+        let (c_new, n_new) = if frozen {
+            // En modo congelado, la matriz no cambia
+            (cell.clone(), normalizer.clone())
+        } else {
+            let f_exp = f_stable.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]).expand([batch_size, self.num_heads, head_dim, head_dim]); 
+            let i_exp = i_stable.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]).expand([batch_size, self.num_heads, head_dim, head_dim]);
+            let cell_update = v.clone().matmul(k.clone());
+            let cn = cell.clone() * f_exp + cell_update * i_exp;
+            
+            let nn = normalizer.clone() * f_stable.clone().reshape::<3, _>([batch_size, self.num_heads, 1]).expand([batch_size, self.num_heads, head_dim]) 
+                      + k.reshape::<3, _>([batch_size, self.num_heads, head_dim]) * i_stable.clone().reshape::<3, _>([batch_size, self.num_heads, 1]).expand([batch_size, self.num_heads, head_dim]);
+            (cn, nn)
+        };
+
+        let head_dim_f = head_dim as f32;
+        let scale = 1.0 / head_dim_f.sqrt();
+        let h_heads = (q.clone() * scale).matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2);
+        
+        let q_step = (q.clone() * scale).reshape::<3, _>([batch_size, self.num_heads, head_dim]);
+        let denominator = (n_new.clone() * q_step).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
+        
+        let ones = Tensor::ones_like(&denominator);
+        let denominator_stable = denominator.abs().max_pair(ones);
+        let h_normalized = h_heads / denominator_stable;
+        
+        let h_new = (h_normalized * o_gate).reshape::<2, _>([batch_size, self.hidden_size]);
+
+        if frozen {
+            (h_new, state)
+        } else {
+            let m_final = m_t.reshape::<3, _>([batch_size, self.num_heads, 1]);
+            (h_new.clone(), MLstmstate::new(c_new, h_new, n_new, m_final))
+        }
+    }
+
     pub fn forward(
         &self,
         input: &Tensor<B, 2>,
@@ -459,68 +562,7 @@ impl<B: Backend> MLstmcell<B> {
     where
         <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
     {
-        let MLstmstate { cell, hidden: _, normalizer, max_gate_log } = state;
-        let [batch_size, _] = input.dims();
-        let head_dim = self.hidden_size / self.num_heads;
-        let _device = input.device();
-
-        // Gates calculation (Scalar projections per head)
-        let gates = input.clone().matmul(self.weight_ih.val().transpose())
-            + self.bias.val().reshape::<2, _>([1, 3 * self.num_heads]);
-
-        let chunks = gates.chunk(3, 1);
-        let i_log = chunks[0].clone().reshape::<2, _>([batch_size, self.num_heads]);
-        let f_log = chunks[1].clone().reshape::<2, _>([batch_size, self.num_heads]);
-        let o_gate = activation::sigmoid(chunks[2].clone()).reshape::<3, _>([batch_size, self.num_heads, 1]); // [B, H, 1]
-
-        // Projections
-        let q = self.w_q.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
-        let k = self.w_k.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
-        let v = self.w_v.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, head_dim, 1]);
-
-        let m_t_minus_1 = max_gate_log.reshape::<2, _>([batch_size, self.num_heads]); 
-        let i_log_m = i_log; 
-        let f_log_m = f_log; // PAPER ACCURATE: pure log-projection
-        let m_t = (f_log_m.clone() + m_t_minus_1.clone()).max_pair(i_log_m.clone()); 
-        
-        // Stable updates for cell and normalizer
-        let f_stable = (f_log_m + m_t_minus_1 - m_t.clone()).exp();
-        let i_stable = (i_log_m - m_t.clone()).exp();
-        
-        // Updates
-        let f_exp = f_stable.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]).expand([batch_size, self.num_heads, head_dim, head_dim]); 
-        let i_exp = i_stable.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]).expand([batch_size, self.num_heads, head_dim, head_dim]);
-
-        let cell_update = v.clone().matmul(k.clone());
-        let c_new = cell * f_exp + cell_update * i_exp;
-        
-        let n_new = normalizer * f_stable.clone().reshape::<3, _>([batch_size, self.num_heads, 1]).expand([batch_size, self.num_heads, head_dim]) 
-                  + k.reshape::<3, _>([batch_size, self.num_heads, head_dim]) * i_stable.clone().reshape::<3, _>([batch_size, self.num_heads, 1]).expand([batch_size, self.num_heads, head_dim]);
-
-        // Numerador: h_tilde = (q_t * scale) @ C_t^T
-        let head_dim_f = head_dim as f32;
-        let scale = 1.0 / head_dim_f.sqrt();
-        let h_heads = (q.clone() * scale).matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2); // [B, H, D]
-        
-        // Denominador escalar (Paper Eq. 13): n_t^T * (q_t * scale)
-        let q_step = (q.clone() * scale).reshape::<3, _>([batch_size, self.num_heads, head_dim]);
-        let denominator = (n_new.clone() * q_step).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
-        
-        // Denominador estable (max(|n^T q|, 1))
-        let ones = Tensor::ones_like(&denominator);
-        let denominator_stable = denominator.abs().max_pair(ones);
-
-        let h_normalized = h_heads / denominator_stable;
-        
-        // --- Output Gate (PAPER ACCURATE per head) ---
-        // h_gated = h_normalized * o_gate -> [B, H, D] * [B, H, 1]
-        let h_gated = h_normalized * o_gate;
-        
-        // Recombinar cabezas para la salida final: [B, H, D] -> [B, Hidden]
-        let h_new = h_gated.reshape::<2, _>([batch_size, self.hidden_size]);
-
-        let new_state = MLstmstate::new(c_new, h_new.clone(), n_new, m_t.reshape::<3, _>([batch_size, self.num_heads, 1]));
-        (h_new, new_state)
+        self.forward_step(input, state, false)
     }
 }
 

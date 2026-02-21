@@ -70,6 +70,18 @@ impl<B: Backend> MinGru<B> {
     where
         <B as Backend>::FloatElem: ToPrimitive + FromPrimitive + Copy,
     {
+        self.forward_ext(input_seq, states, false)
+    }
+
+    pub fn forward_ext(
+        &self,
+        input_seq: Tensor<B, 3>,
+        states: Option<alloc::vec::Vec<MinGruState<B>>>,
+        frozen: bool,
+    ) -> (Tensor<B, 3>, alloc::vec::Vec<MinGruState<B>>)
+    where
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive + Copy,
+    {
         let [batch_size, _seq_len, _] = input_seq.dims();
         let device = input_seq.device();
 
@@ -84,7 +96,7 @@ impl<B: Backend> MinGru<B> {
         // El bucle de tiempo ya es paralelo dentro de layer.forward
         let mut new_states = alloc::vec::Vec::with_capacity(self.num_layers);
         let output = self.layers.iter().zip(hidden_states).fold(input_seq, |x, (layer, state)| {
-            let (out, ns) = layer.forward(x, state);
+            let (out, ns) = layer.forward(x, state, frozen);
             new_states.push(ns);
             out
         });
@@ -125,6 +137,7 @@ impl<B: Backend> MinGruLayer<B> {
         &self,
         x: Tensor<B, 3>,
         state: MinGruState<B>,
+        frozen: bool,
     ) -> (Tensor<B, 3>, MinGruState<B>)
     where
         <B as Backend>::FloatElem: ToPrimitive + FromPrimitive + Copy,
@@ -167,7 +180,7 @@ impl<B: Backend> MinGruLayer<B> {
 
         // 4. Contribución del Estado Inicial
         // h_0 es [B, H]. Se escala por P_t
-        let h_0 = state.hidden.reshape::<3, _>([batch_size, 1, self.d_hidden]);
+        let h_0 = state.hidden.clone().reshape::<3, _>([batch_size, 1, self.d_hidden]);
         let h_seq_initial = p_t * h_0;
 
         let h_seq = h_seq_parallel + h_seq_initial;
@@ -175,8 +188,8 @@ impl<B: Backend> MinGruLayer<B> {
         // 5. Update State (último elemento)
         let last_h = h_seq.clone().slice([0..batch_size, seq_len-1..seq_len, 0..self.d_hidden])
             .reshape([batch_size, self.d_hidden]);
-
-        (h_seq, MinGruState::new(last_h))
+        let final_state = if frozen { state } else { MinGruState::new(last_h) };
+        (h_seq, final_state)
     }
 }
 

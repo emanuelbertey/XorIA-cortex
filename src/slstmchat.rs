@@ -285,7 +285,9 @@ where
             .select(0, indices)
             .reshape([1, seq_len, vocab_size]);
 
-        let (output, next_state) = model.forward(input, current_state);
+        // Usamos el nuevo forward_refine con 3 loops para mejorar la calidad
+        // "Escribe una vez (último loop), lee muchas (loops previos)"
+        let (output, next_state) = model.forward_refine(input, current_state, 1);
         current_state = Some(next_state);
 
         let dims = output.dims();
@@ -358,17 +360,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let num_layers = 1;//let num_layers = 2;
     let num_blocks = 2; //let num_blocks = 4;
     let output_size = vocab_size; 
-    let dropout = 0.1;
+    let dropout = 0.3;
 
     let seq_length = 128; //32 Reducido para evitar explosión de memoria
     let batch_size = 16; // Mucho más seguro para CPU
     let stride = 128;     //seq_length 64 Salto igual al contexto
-    let num_epochs = 50;
+    let num_epochs = 25;
     let num_heads = 4;
     // Learning rates por bloque (igual que main.rs)
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        1e-4, // mLSTM learning rate (increased to 1e-3 to learn faster now that gradients are clipped)
+        5e-4, // mLSTM learning rate (increased to 1e-3 to learn faster now that gradients are clipped)
         1e-3,
         1e-3, // Other components learning rate
     );
@@ -377,7 +379,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  Bloques: {}", num_blocks);
     println!("  Hidden size: {}", hidden_size);
     println!("  Seq length: {}", seq_length);
-    println!("  Batch size: {}", batch_size);
+    println!("  Batch size: {}", batch_size);   
     println!("  Epochs: {}\n", num_epochs);
 
     // Device
@@ -466,7 +468,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_beta_2(0.999)
             .with_epsilon(1e-8)
             .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.3)))
             .init();
 
 

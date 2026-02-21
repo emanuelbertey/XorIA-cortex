@@ -110,6 +110,15 @@ impl<B: Backend> SLstm<B> {
         input_seq: &Tensor<B, 3>,
         states: Option<alloc::vec::Vec<SLstmstate<B, 2>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<SLstmstate<B, 2>>) {
+        self.forward_ext(input_seq, states, false)
+    }
+
+    pub fn forward_ext(
+        &self,
+        input_seq: &Tensor<B, 3>,
+        states: Option<alloc::vec::Vec<SLstmstate<B, 2>>>,
+        frozen: bool,
+    ) -> (Tensor<B, 3>, alloc::vec::Vec<SLstmstate<B, 2>>) {
         let device = input_seq.device();
         let [batch_size, seq_length, _] = input_seq.dims();
 
@@ -130,7 +139,7 @@ impl<B: Backend> SLstm<B> {
                     .slice([0..batch_size, t..(t + 1), 0..(4 * layer.hidden_size)])
                     .squeeze(1);
 
-                let (h_new, new_state) = layer.forward_step(input_t_projected, state);
+                let (h_new, new_state) = layer.forward_step(input_t_projected, state, frozen);
                 state = new_state;
                 layer_outputs.push(h_new.unsqueeze_dim(1));
             }
@@ -209,11 +218,19 @@ impl<B: Backend> SLstmcell<B> {
 
     pub fn forward(&self, input: Tensor<B, 2>, state: SLstmstate<B, 2>) -> (Tensor<B, 2>, SLstmstate<B, 2>) {
         let projected = input.matmul(self.weight_ih.val().transpose()) + self.bias.val().unsqueeze_dim(0);
-        self.forward_step(projected, state)
+        self.forward_step(projected, state, false)
     }
 
-    pub fn forward_step(&self, input_projected: Tensor<B, 2>, state: SLstmstate<B, 2>) -> (Tensor<B, 2>, SLstmstate<B, 2>) {
-        let SLstmstate { cell, hidden, normalizer, max_gate_log } = state;
+    pub fn forward_step(
+        &self, 
+        input_projected: Tensor<B, 2>, 
+        state: SLstmstate<B, 2>,
+        frozen: bool,
+    ) -> (Tensor<B, 2>, SLstmstate<B, 2>) {
+        let cell = state.cell.clone();
+        let hidden = state.hidden.clone();
+        let normalizer = state.normalizer.clone();
+        let max_gate_log = state.max_gate_log.clone();
 
         let gates = input_projected + hidden.matmul(self.weight_hh.val().transpose());
         let chunks = gates.chunk(4, 1);
@@ -223,24 +240,23 @@ impl<B: Backend> SLstmcell<B> {
         let z = chunks[2].clone().tanh();
         let o = activation::sigmoid(chunks[3].clone());
 
-        // Log-space stabilization: m_t = max(f_log + m_{t-1}, i_log)
-        let m_prev_plus_f = f_log + max_gate_log;
-        let m_new = m_prev_plus_f.clone().max_pair(i_log.clone());
+        let m_prev_plus_f = f_log + max_gate_log.clone();
+        let m_new = if frozen { max_gate_log.clone() } else { m_prev_plus_f.clone().max_pair(i_log.clone()) };
 
-        // Stabilized exponentials
         let i_exp = (i_log - m_new.clone()).exp();
         let f_exp = (m_prev_plus_f - m_new.clone()).exp();
 
-        // Updates
-        let c_new = f_exp.clone() * cell + i_exp.clone() * z;
-        let n_new = f_exp * normalizer + i_exp;
+        let c_new = if frozen { cell.clone() } else { f_exp.clone() * cell.clone() + i_exp.clone() * z };
+        let n_new = if frozen { normalizer.clone() } else { f_exp * normalizer.clone() + i_exp };
 
-        // Output normalization (Robust to small n_new)
-        // Usamos max_pair con epsilon para evitar que n_new=0 rompa el gradiente,
-        // pero sin el sesgo aditivo que se amplifica en el espacio logarítmico.
+        // Output normalization
         let n_stable = n_new.clone().max_pair(n_new.full_like(self.epsilon));
         let h_new = o * (c_new.clone() / n_stable);
 
-        (h_new.clone(), SLstmstate::new(c_new, h_new, n_new, m_new))
+        if frozen {
+            (h_new, state)
+        } else {
+            (h_new.clone(), SLstmstate::new(c_new, h_new, n_new, m_new))
+        }
     }
 }
