@@ -69,7 +69,7 @@ pub struct SLstmconfig {
     pub exp_clamp_max: f32,
     #[config(default = "0.0")]
     pub stabilizer_init: f32,
-    #[config(default = "Initializer::XavierNormal{gain: 1.0}")]
+    #[config(default = "Initializer::Normal{mean: 0.0, std: 0.02}")]
     pub initializer: Initializer,
 }
 

@@ -397,7 +397,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_dropout(dropout)
         .with_num_heads(num_heads)
         .with_lstm_type(LstmType::SLSTM)  
-        .with_initializer(burn::nn::Initializer::XavierNormal { gain: 1.0 })
         .with_use_projection(true);   
 
     // Verificar si existe un modelo guardado (una sola vez)

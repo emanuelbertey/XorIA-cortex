@@ -287,7 +287,7 @@ where
 
         // Usamos el nuevo forward_refine con 3 loops para mejorar la calidad
         // "Escribe una vez (último loop), lee muchas (loops previos)"
-        let (output, next_state) = model.forward_refine(input, current_state, 1);
+        let (output, next_state) = model.forward(input, current_state);
         current_state = Some(next_state);
 
         let dims = output.dims();
@@ -329,7 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let text_file = &args[1];
     let tokenizer_path = "tokenizer.json";
-    let model_path = "MLSTM_chat_model";
+    let model_path = "MLSTM_chat_morre_rl_model"; 
 
     // Intentar leer vocab_size de argumentos o usar 2000 por defecto
     let target_vocab_size = 1024;
@@ -365,14 +365,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let seq_length = 128; //32 Reducido para evitar explosión de memoria
     let batch_size = 16; // Mucho más seguro para CPU
     let stride = 128;     //seq_length 64 Salto igual al contexto
-    let num_epochs = 25;
+    let num_epochs = 15;
     let num_heads = 4;
-    // Learning rates por bloque (igual que main.rs)
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        5e-4, // mLSTM learning rate (increased to 1e-3 to learn faster now that gradients are clipped)
+        1e-4, // mLSTM learning rate
         1e-3,
-        1e-3, // Other components learning rate
+        1e-3, // Other components learning rate (reverted to 1e-3)
     );
 
     println!("Configuración del modelo:");
@@ -397,7 +396,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_dropout(dropout)
         .with_num_heads(num_heads)
         .with_lstm_type(LstmType::MLSTM) 
-        .with_initializer(burn::nn::Initializer::XavierNormal { gain: 1.0 })
         .with_use_projection(true);   
 
     // Verificar si existe un modelo guardado (una sola vez)
@@ -465,10 +463,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut optim = AdamConfig::new()
             .with_beta_1(0.9)
-            .with_beta_2(0.999)
+            .with_beta_2(0.979)
             .with_epsilon(1e-8)
-            .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.3)))
+            .with_weight_decay(Some(WeightDecayConfig::new(1e-5)))
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(5.0)))
             .init();
 
 

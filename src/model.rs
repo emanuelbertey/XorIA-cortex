@@ -122,7 +122,7 @@ pub struct XLstmconfig {
     #[config(default = "false")]
     pub use_mlp: bool,
     /// Weight initializer
-    #[config(default = "Initializer::XavierNormal{gain:1.0}")]
+    #[config(default = "Initializer::Normal{mean: 0.0, std: 0.02}")]
     pub initializer: Initializer,
 }
 

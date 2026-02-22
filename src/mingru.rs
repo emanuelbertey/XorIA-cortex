@@ -38,7 +38,7 @@ pub struct MinGruConfig {
     pub clamp_max: f64,
     #[config(default = "-3.0")]
     pub gate_bias: f32,
-    #[config(default = "Initializer::XavierNormal{gain:1.0}")]
+    #[config(default = "Initializer::Normal{mean: 0.0, std: 0.02}")]
     pub initializer: Initializer,
 }
 
