@@ -98,13 +98,16 @@ pub struct MLstmconfig {
     /// Attention scale (Standard 1/sqrt(head_dim) = 0.125 for 256/4)
     #[config(default = "0.125")]
     pub attention_scale: f32,
+    /// Projection expansion factor for internal matrix memory
+    #[config(default = "2.0")]
+    pub proj_factor: f32,
 }
 impl MLstmconfig {
     /// Initialize a new mLSTM
     pub fn init<B: Backend>(&self, device: &B::Device) -> MLstm<B> {
         let layers = (0..self.num_layers)
-            .map(|i| {
-                let input_size = if i == 0 { self.d_input } else { self.d_hidden };
+            .map(|_i| {
+                let input_size = self.d_input; // With down projection, every module takes d_input and returns d_input.
                 MLstmcell::new(input_size, self.d_hidden, self.num_heads, self, device)
             })
             .collect();
@@ -124,6 +127,7 @@ impl MLstmconfig {
             exp_clamp_max: self.exp_clamp_max,
             stabilizer_init: self.stabilizer_init,
             attention_scale: self.attention_scale,
+            proj_factor: self.proj_factor,
         }
     }
 }
@@ -159,6 +163,8 @@ pub struct MLstm<B: Backend> {
     pub stabilizer_init: f32,
     /// Attention scale
     pub attention_scale: f32,
+    /// Projection expansion factor
+    pub proj_factor: f32,
 }
 
 impl<B: Backend> MLstm<B> {
@@ -217,7 +223,8 @@ impl<B: Backend> MLstm<B> {
 
     /// Initialize hidden states
     fn init_hidden(&self, batch_size: usize, device: &B::Device) -> alloc::vec::Vec<MLstmstate<B>> {
-        let head_dim = self.d_hidden / self.num_heads;
+        let internal_hidden_size = (self.d_hidden as f32 * self.proj_factor) as usize;
+        let head_dim = internal_hidden_size / self.num_heads;
         
         (0..self.num_layers)
             .map(|_| {
@@ -245,10 +252,14 @@ pub struct MLstmcell<B: Backend> {
     pub w_k: Linear<B>,
     /// Value projection
     pub w_v: Linear<B>,
+    /// Output projection (Down-Projection)
+    pub w_proj: Linear<B>,
     /// Input size
     pub input_size: usize,
-    /// Hidden size
+    /// Target hidden size (output size)
     pub hidden_size: usize,
+    /// Internal expanded hidden size
+    pub internal_hidden_size: usize,
     /// Number of heads
     pub num_heads: usize,
     /// Epsilon for numerical stability
@@ -269,6 +280,7 @@ impl<B: Backend> MLstmcell<B> {
         config: &MLstmconfig,
         device: &B::Device,
     ) -> Self {
+        let internal_hidden_size = (hidden_size as f32 * config.proj_factor) as usize;
         let mut bias_data = alloc::vec![0.0; 3 * num_heads];
         for i in 0..num_heads {
             bias_data[i] = config.input_bias;             // Input gate: Aligned with config
@@ -277,16 +289,16 @@ impl<B: Backend> MLstmcell<B> {
         }
         let bias = Tensor::from_floats(bias_data.as_slice(), device);
 
-        // Initialize Q, K, V with configured initializer
-        let w_q = LinearConfig::new(input_size, hidden_size)
+        // Initialize Q, K, V with configured initializer to target internal expanded memory
+        let w_q = LinearConfig::new(input_size, internal_hidden_size)
             .with_bias(false)
             .with_initializer(config.initializer.clone())
             .init(device);
-        let w_k = LinearConfig::new(input_size, hidden_size)
+        let w_k = LinearConfig::new(input_size, internal_hidden_size)
             .with_bias(false)
             .with_initializer(config.initializer.clone())
             .init(device);
-        let w_v = LinearConfig::new(input_size, hidden_size)
+        let w_v = LinearConfig::new(input_size, internal_hidden_size)
             .with_bias(false)
             .with_initializer(config.initializer.clone())
             .init(device);
@@ -296,6 +308,10 @@ impl<B: Backend> MLstmcell<B> {
             Some(3 * num_heads),
             device,
         );
+        let w_proj = LinearConfig::new(internal_hidden_size, hidden_size)
+            .with_bias(true)
+            .with_initializer(config.initializer.clone())
+            .init(device);
 
         Self {
             weight_ih,
@@ -303,8 +319,10 @@ impl<B: Backend> MLstmcell<B> {
             w_q,
             w_k,
             w_v,
+            w_proj,
             input_size,
             hidden_size,
+            internal_hidden_size,
             num_heads,
             epsilon: config.epsilon,
             exp_clamp_min: config.exp_clamp_min,
@@ -343,7 +361,7 @@ impl<B: Backend> MLstmcell<B> {
         <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
     {
         let [batch_size, seq_len, _] = input_seq.dims();
-        let head_dim = self.hidden_size / self.num_heads;
+        let head_dim = self.internal_hidden_size / self.num_heads;
         let device = input_seq.device();
 
         // 1. Parallel Projections (Q, K, V)
@@ -484,8 +502,11 @@ impl<B: Backend> MLstmcell<B> {
         // --- Output Gate ---
         let h_gated = h_normalized * o_gate;
         
-        // Recombinar cabezas para la salida final: [B, H, S, D] -> [B, S, Hidden]
-        let h_seq = h_gated.swap_dims(1, 2).reshape::<3, _>([batch_size, seq_len, self.hidden_size]);
+        // Recombinar cabezas para la salida final antes de proyección
+        let h_seq_internal = h_gated.swap_dims(1, 2).reshape::<3, _>([batch_size, seq_len, self.internal_hidden_size]);
+
+        // Compactación final (Down-Projection) a hidden_size
+        let y_t = self.w_proj.forward(h_seq_internal.clone());
 
         // --- State Update for Next Step (FAITHFUL TO PAPER) ---
         let last_idx = seq_len - 1;
@@ -514,12 +535,12 @@ impl<B: Backend> MLstmcell<B> {
         } else { 
             MLstmstate::new(
                 final_cell, 
-                h_seq.clone().slice([0..batch_size, last_idx..last_idx+1, 0..self.hidden_size]).reshape([batch_size, self.hidden_size]), 
+                y_t.clone().slice([0..batch_size, last_idx..last_idx+1, 0..self.hidden_size]).reshape([batch_size, self.hidden_size]), 
                 final_norm, 
                 final_m
             ) 
         };
-        (h_seq, final_state)
+        (y_t, final_state)
     }
     /// Forward pass through mLSTM cell with optional state freezing
     pub fn forward_step(
@@ -535,7 +556,7 @@ impl<B: Backend> MLstmcell<B> {
         let normalizer = state.normalizer.clone();
         let max_gate_log = state.max_gate_log.clone();
         let [batch_size, _] = input.dims();
-        let head_dim = self.hidden_size / self.num_heads;
+        let head_dim = self.internal_hidden_size / self.num_heads;
 
         // Gates calculation
         let gates = input.clone().matmul(self.weight_ih.val().transpose())
@@ -589,13 +610,16 @@ impl<B: Backend> MLstmcell<B> {
         
         // o_gate (PAPER ACCURATE: Sigmoid)
         let o_gate = activation::sigmoid(o_log.reshape::<3, _>([batch_size, self.num_heads, 1]));
-        let h_new = (h_normalized * o_gate).reshape::<2, _>([batch_size, self.hidden_size]);
+        let h_new = (h_normalized * o_gate).reshape::<2, _>([batch_size, self.internal_hidden_size]);
+
+        // Compactación final (Down-Projection)
+        let y_new = self.w_proj.forward(h_new.clone());
 
         if frozen {
-            (h_new, state)
+            (y_new, state)
         } else {
             let m_final = m_t.reshape::<3, _>([batch_size, self.num_heads, 1]);
-            (h_new.clone(), MLstmstate::new(c_new, h_new, n_new, m_final))
+            (y_new.clone(), MLstmstate::new(c_new, y_new, n_new, m_final))
         }
     }
 
@@ -631,7 +655,7 @@ mod tests {
         assert_eq!(output.dims(), [4, 10, 128]);
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].hidden.dims(), [4, 128]);
-        assert_eq!(states[0].cell.dims(), [4, 4, 32, 32]);
+        assert_eq!(states[0].cell.dims(), [4, 4, 64, 64]);
     }
 // // 
 // //
@@ -644,16 +668,16 @@ mod tests {
 
         let input = Tensor::<TestBackend, 2>::random([4, 32], Distribution::Default, &device);
         let state = MLstmstate::new(
-            Tensor::<TestBackend, 4>::zeros([4, num_heads, 16, 16], &device),
+            Tensor::<TestBackend, 4>::zeros([4, num_heads, 32, 32], &device),
             Tensor::<TestBackend, 2>::zeros([4, 64], &device),
-            Tensor::<TestBackend, 3>::zeros([4, num_heads, 16], &device),
+            Tensor::<TestBackend, 3>::zeros([4, num_heads, 32], &device),
             Tensor::<TestBackend, 3>::zeros([4, num_heads, 1], &device),
         );
 
         let (h_new, new_state) = cell.forward(&input, state);
 
         assert_eq!(h_new.dims(), [4, 64]);
-        assert_eq!(new_state.cell.dims(), [4, 4, 16, 16]);
+        assert_eq!(new_state.cell.dims(), [4, 4, 32, 32]);
         assert_eq!(new_state.hidden.dims(), [4, 64]);
     }
 

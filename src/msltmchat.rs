@@ -365,11 +365,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let seq_length = 128; //32 Reducido para evitar explosión de memoria
     let batch_size = 16; // Mucho más seguro para CPU
     let stride = 128;     //seq_length 64 Salto igual al contexto
-    let num_epochs = 15;
+    let num_epochs = 20;
     let num_heads = 4;
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        1e-6, // mLSTM learning rate
+        8e-4, // mLSTM learning rate
         1e-3,
         1e-3, // Other components learning rate (reverted to 1e-3)
     );

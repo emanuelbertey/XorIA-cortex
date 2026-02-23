@@ -25,7 +25,8 @@ fn run_equivalence() {
         &device
     );
     
-    let head_dim = hidden_size / num_heads;
+    let internal_hidden_size = (hidden_size as f32 * 2.0) as usize; // Default proj_factor is 2.0
+    let head_dim = internal_hidden_size / num_heads;
     
     let initial_state = MLstmstate::new(
         Tensor::<TestBackend, 4>::zeros([batch_size, num_heads, head_dim, head_dim], &device),
