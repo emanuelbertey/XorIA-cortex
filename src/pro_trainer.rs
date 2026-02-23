@@ -51,11 +51,16 @@ impl Tokenizer {
         tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
         tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
 
+        // Agregar token especial <|endoftext|>
+        let special_token = "<|endoftext|>";
+        tokenizer.add_special_tokens(&[tokenizers::AddedToken::from(special_token, true)]);
+
         let trainer = BpeTrainerBuilder::default()
             .show_progress(true)
             .vocab_size(vocab_size)
             .min_frequency(0)
             .initial_alphabet(ByteLevel::alphabet().into_iter().collect::<HashSet<_>>())
+            .special_tokens(vec![tokenizers::AddedToken::from(special_token, true)])
             .build();
 
         let mut trainer_wrapper = TrainerWrapper::from(trainer);
@@ -95,6 +100,10 @@ impl Tokenizer {
 
     pub fn id_to_token(&self, id: usize) -> Option<String> {
         self.tokenizer.id_to_token(id as u32)
+    }
+
+    pub fn token_to_id(&self, token: &str) -> Option<usize> {
+        self.tokenizer.token_to_id(token).map(|id| id as usize)
     }
 }
 
@@ -287,6 +296,8 @@ where
     let mut current_state = None; 
     let mut current_tokens = seed_tokens.clone();
 
+    let eof_id = tokenizer.token_to_id("<|endoftext|>");
+
     for i in 0..length {
         let tokens_to_process = if i == 0 { current_tokens.clone() } else { vec![*current_tokens.last().unwrap()] };
         let seq_len = tokens_to_process.len();
@@ -305,6 +316,12 @@ where
         let last_logits = output.slice([0..1, (dims[1] - 1)..dims[1], 0..dims[2]]).reshape([1, dims[2]]);
         
         let next_token = sample_from_logits(last_logits, 0.7, 40, 0.9);
+
+        if Some(next_token) == eof_id {
+             println!("======= <|endoftext|> ======\n");
+             println!("Tokens generados: {}\n", i);
+            break;
+        }
 
         current_tokens.push(next_token);
         generated_ids.push(next_token);
@@ -341,34 +358,62 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("Archivos encontrados: {}", all_files.len());
 
-    let target_vocab_size = 2048;
+    let target_vocab_size = 4096;
     let tokenizer_file = Path::new(tokenizer_path);
-    let tokenizer = if tokenizer_file.exists() && fs::metadata(tokenizer_file).map(|m| m.len()).unwrap_or(0) > 5000 {
-        Tokenizer::load(tokenizer_path)?
-    } else {
-        println!("Entrenando nuevo tokenizador con {} archivos...", all_files.len().min(100));
-        let mut sample_text = String::new();
-        for file_path in all_files.iter().take(100) {
-            if let Ok(content) = fs::read_to_string(file_path) {
-                sample_text.push_str(&content.chars().take(10000).collect::<String>());
+    
+    let mut needs_training = true;
+    let mut tokenizer = None;
+
+    if tokenizer_file.exists() {
+        if let Ok(loaded_t) = Tokenizer::load(tokenizer_path) {
+            let current_vocab = loaded_t.vocab_size();
+            if current_vocab >= target_vocab_size {
+                println!("✅ Tokenizador cargado con vocabulario suficiente: {}", current_vocab);
+                tokenizer = Some(loaded_t);
+                needs_training = false;
+            } else {
+                println!("⚠️ Tokenizador existente insuficiente ({} < {}). Re-entrenando...", current_vocab, target_vocab_size);
             }
         }
-        if sample_text.trim().len() < 100 {
-            return Err("Error: Muestras insuficientes para entrenar el tokenizador. Revisa la ruta.".into());
+    }
+
+    let tokenizer = if needs_training {
+        println!("🚀 Entrenando nuevo tokenizador con {} archivos...", all_files.len().min(100));
+        let mut sample_text = String::new();
+        let special_token = "<|endoftext|>";
+        sample_text.push_str(special_token);
+        
+        for file_path in all_files.iter().take(100) {
+            if let Ok(mut file) = fs::File::open(file_path) {
+                let mut content = String::new();
+                let mut reader = BufReader::new(file).take(500_000); // 500KB por archivo
+                if reader.read_to_string(&mut content).is_ok() {
+                    sample_text.push_str(&content);
+                    sample_text.push_str(special_token);
+                }
+            }
         }
+        
+        if sample_text.trim().len() < 1000 {
+            return Err("Error: Muestras insuficientes para alcanzar 4096 tokens.".into());
+        }
+        
         println!("  -> Bytes totales para entrenamiento: {}", sample_text.len());
-        let tokenizer = Tokenizer::from_text(&sample_text, target_vocab_size)?;
-        tokenizer.save(tokenizer_path)?;
-        tokenizer
+        let t = Tokenizer::from_text(&sample_text, target_vocab_size)?;
+        t.save(tokenizer_path)?;
+        println!("✨ Tokenizador guardado (Vocab: {})", t.vocab_size());
+        t
+    } else {
+        tokenizer.unwrap()
     };
 
     let vocab_size = tokenizer.vocab_size();
     println!("Resumen: Vocabulario={}, Archivos={}", vocab_size, all_files.len());
     
-    let hidden_size = 512;
+    let hidden_size = 256;
     let num_layers = 1;
     let seq_length = 256;
-    let batch_size = 10;
+    let batch_size = 16;
     let stride = 256;
     let num_epochs = 50;
 
@@ -378,7 +423,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // DEFINICIÓN DEL ORDEN DE BLOQUES
     let block_layout = vec![
-       BlockType::MLSTM, 
+      // BlockType::MLSTM, 
         BlockType::MLSTM, 
         BlockType::MLSTM, 
         BlockType::MLSTM, 
@@ -389,7 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let lr_config = LearningRateConfig::per_block_type(
         1e-4, // sLSTM
-        6e-4, // mLSTM
+        1e-6, // mLSTM
         1e-3, // minGRU
         1e-4, // Others
     );
@@ -423,7 +468,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
 
-    if choice.trim() == "2" {
+    let mut skip_batches = 0;
+    if choice.trim() == "1" {
+        print!("Saltar hasta el batch (0 para empezar desde el inicio) > ");
+        io::stdout().flush()?;
+        let mut skip_input = String::new();
+        io::stdin().read_line(&mut skip_input)?;
+        skip_batches = skip_input.trim().parse::<usize>().unwrap_or(0);
+    } else if choice.trim() == "2" {
         println!("\nModo Inferencia Chat");
         println!("====================");
         println!("Comandos:");
@@ -510,10 +562,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("\nIniciando entrenamiento por fragmentos...");
 
+    let mut global_batches_skipped = 0;
+
     for epoch in 0..num_epochs {
         println!("\n--- Época {}/{} ---", epoch + 1, num_epochs);
         let mut total_loss = 0.0f32;
-        let mut num_batches_processed = 0;
+        let mut processed_in_epoch = 0;
 
         let mut last_save_time = Instant::now();
         let mut token_buffer = Vec::new();
@@ -540,6 +594,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 while token_buffer.len() >= tokens_needed_for_batch + 1 {
                     let batch_start_time = Instant::now();
                     
+                    if global_batches_skipped < skip_batches {
+                        global_batches_skipped += 1;
+                        token_buffer.drain(0..tokens_per_batch);
+                        if global_batches_skipped % 100 == 0 || global_batches_skipped == skip_batches {
+                            print!("\r    ⏩ Saltando batches: {}/{}... ", global_batches_skipped, skip_batches);
+                            io::stdout().flush().unwrap();
+                        }
+                        continue;
+                    }
+
                     let (input, target) = create_batch::<MyBackend>(
                         &token_buffer, 0, batch_size, seq_length, stride, vocab_size, &device
                     );
@@ -555,8 +619,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     model = model.optimizer_step(&lr_config, &mut optim, grads);
 
                     // --- DEBUG: Inspeccionar exactamente lo que entra al modelo ---
-                    if epoch == 0 && num_batches_processed == 0 {
-                        println!("\n--- 🔍 PRIMER BATCH (TEXTO LIMPIO) ---");
+                    if processed_in_epoch == 0 {
+                        println!("\n--- 🔍 PRIMER BATCH ENTRENADO (EP:{}, GLOBAL:{}) ---", epoch, global_batches_skipped);
                         for b_idx in 0..2.min(batch_size) {
                             let start = b_idx * stride;
                             let indices = &token_buffer[start..start + seq_length];
@@ -576,15 +640,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     total_loss += loss_val;
-                    num_batches_processed += 1;
+                    processed_in_epoch += 1;
+                    global_batches_skipped += 1;
 
                     // Consumimos los tokens procesados del búfer
                     token_buffer.drain(0..tokens_per_batch);
 
                     // Reporte fluido
                     let elapsed = batch_start_time.elapsed().as_secs_f32();
-                    print!("\r    Batch {} | Loss: {:.4} | Time: {:.3}s | Buf: {}     ", 
-                        num_batches_processed, total_loss / num_batches_processed as f32, elapsed, token_buffer.len());
+                    print!("\r    Global Batch {} | Loss: {:.4} | Time: {:.3}s | Buf: {}     ", 
+                        global_batches_skipped, loss_val, elapsed, token_buffer.len());
                     io::stdout().flush().unwrap();
 
                     // --- GUARDADO Y GENERACIÓN AUTOMÁTICA ---
@@ -618,7 +683,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             // --- FIX: Separador entre archivos para evitar que se peguen las palabras ---
-            token_buffer.extend(tokenizer.encode("\n")); 
+            token_buffer.extend(tokenizer.encode("<|endoftext|>")); 
         }
         println!("\n  ✅ Época finalizada. Guardando...");
         let recorder = CompactRecorder::new();
