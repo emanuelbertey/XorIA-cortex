@@ -25,24 +25,14 @@ fn run_equivalence() {
         Tensor::<TestBackend, 2>::zeros([batch_size, hidden_size], &device),
         Tensor::<TestBackend, 2>::zeros([batch_size, hidden_size], &device),
     );
-    let projected_input = input_seq.clone().matmul(
-        layer
-            .weight_ih
-            .val()
-            .transpose()
-            .unsqueeze_dim::<3>(0),
-    ) + layer
-        .bias
-        .val()
-        .unsqueeze_dim::<2>(0)
-        .unsqueeze_dim::<3>(0);
+
     let mut outputs: Vec<Tensor<TestBackend, 3>> = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
-        let input_t = projected_input
+        let input_t = input_seq
             .clone()
-            .slice([0..batch_size, t..(t + 1), 0..(4 * hidden_size)])
-            .squeeze(1);
-        let (h_new, new_state) = layer.forward_step(input_t, state);
+            .slice([0..batch_size, t..(t + 1), 0..input_size])
+            .squeeze(1); // [batch_size, input_size]
+        let (h_new, new_state) = layer.forward(input_t, state);
         outputs.push(h_new.unsqueeze_dim(1));
         state = new_state;
     }

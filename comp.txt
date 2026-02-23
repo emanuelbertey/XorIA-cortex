@@ -19,6 +19,7 @@ $env:RUST_BACKTRACE=1; cargo run --release --bin mlstm_mingru_chat -- input.txt
 
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- ./data
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- "/media/emabertey/500 wu/Repos/"
+$env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- "/media/emabertey/500 wu/Windows.old/Users/emabertey/Downloads/dataset/tiny"
 cargo run --release --bin mlstmchat -- input.txt
 
 cargo test test_mlstm_dual_equivalence -- --nocapture

@@ -434,7 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let lr_config = LearningRateConfig::per_block_type(
         1e-4, // sLSTM
-        1e-6, // mLSTM
+        8e-7, // mLSTM
         1e-3, // minGRU
         1e-4, // Others
     );

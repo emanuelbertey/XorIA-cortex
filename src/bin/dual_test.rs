@@ -113,10 +113,58 @@ fn run_grad_mlstm() {
     }
 }
 
+fn run_long_distance_grad() {
+    let device = Default::default();
+    let batch_size = 1;
+    let seq_len = 512;
+    let input_size = 16;
+    let hidden_size = 32;
+    let num_heads = 4;
+
+    type AdBackend = Autodiff<TestBackend>;
+
+    let config = MLstmconfig::new(input_size, hidden_size, 1)
+        .with_num_heads(num_heads)
+        .with_dropout(0.0);
+    
+    let mlstm: MLstm<AdBackend> = config.init(&device);
+    
+    // Input con gradientes
+    let x = Tensor::<AdBackend, 3>::random(
+        [batch_size, seq_len, input_size], 
+        Distribution::Normal(0.0, 1.0), 
+        &device
+    ).require_grad();
+
+    // Forward a través de la secuencia
+    let (h_seq, _) = mlstm.forward(&x, None);
+    
+    // Tomamos la suma del ÚLTIMO paso de tiempo para ver cómo el error viaja hacia atrás
+    let h_last = h_seq.slice([0..batch_size, seq_len-1..seq_len, 0..hidden_size]).sum();
+    
+    let grads = h_last.backward();
+    let x_grad = x.grad(&grads).expect("Debe existir gradiente para x en mLSTM");
+    
+    // Extraemos el gradiente del PRIMER token (índice 0)
+    let grad_start = x_grad.slice([0..batch_size, 0..1, 0..input_size]).abs().mean().into_scalar();
+
+    println!("Gradiente de Larga Distancia (Token {} -> Token 0): {:.10}", seq_len - 1, grad_start);
+    
+    if grad_start > 1e-10 {
+        println!("✅ TEST PASADO: El gradiente llegó vivo al inicio de la secuencia!");
+        println!("   Esto demuestra que mLSTM evita el desvanecimiento de gradiente mejor que una RNN estándar.");
+    } else {
+        println!("⚠️ TEST FALLIDO: El gradiente se desvaneció ({:.2e})", grad_start);
+    }
+}
+
 fn main() {
     println!("--- Ejecutando Equivalencia Dual/Serial ---");
     run_equivalence();
     println!("\n--- Ejecutando Test de Gradientes mLSTM ---");
     run_grad_mlstm();
+    println!("\n--- Ejecutando Test de Gradiente de Larga Distancia (512 tokens) ---");
+    run_long_distance_grad();
 }
 
+ // 

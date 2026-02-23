@@ -369,7 +369,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let num_heads = 4;
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        1e-4, // mLSTM learning rate
+        1e-6, // mLSTM learning rate
         1e-3,
         1e-3, // Other components learning rate (reverted to 1e-3)
     );

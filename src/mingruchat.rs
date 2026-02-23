@@ -464,7 +464,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_beta_2(0.999)
             .with_epsilon(1e-8)
             .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(5.0)))
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
             .init();
 
         println!("Iniciando entrenamiento...\n");
