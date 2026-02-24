@@ -81,9 +81,9 @@ pub struct MLstmconfig {
     #[config(default = "0.0")]
     pub forget_bias: f32,
     /// Input gate bias
-    #[config(default = "-2.0")] 
+    #[config(default = "-1.0")] 
     pub input_bias: f32,
-    /// Epsilon for numerical stability
+    /// Epsilon for numerical stability f
     #[config(default = "1e-6")]
     pub epsilon: f32,
     /// Minimum value for exponential clamping
@@ -106,8 +106,8 @@ impl MLstmconfig {
     /// Initialize a new mLSTM
     pub fn init<B: Backend>(&self, device: &B::Device) -> MLstm<B> {
         let layers = (0..self.num_layers)
-            .map(|_i| {
-                let input_size = self.d_input; // With down projection, every module takes d_input and returns d_input.
+            .map(|i| {
+                let input_size = if i == 0 { self.d_input } else { self.d_hidden };
                 MLstmcell::new(input_size, self.d_hidden, self.num_heads, self, device)
             })
             .collect();
@@ -126,7 +126,6 @@ impl MLstmconfig {
             exp_clamp_min: self.exp_clamp_min,
             exp_clamp_max: self.exp_clamp_max,
             stabilizer_init: self.stabilizer_init,
-            attention_scale: self.attention_scale,
             proj_factor: self.proj_factor,
         }
     }
@@ -161,8 +160,6 @@ pub struct MLstm<B: Backend> {
     pub exp_clamp_max: f32,
     /// Initial value for the stabilizer
     pub stabilizer_init: f32,
-    /// Attention scale
-    pub attention_scale: f32,
     /// Projection expansion factor
     pub proj_factor: f32,
 }
@@ -289,6 +286,9 @@ impl<B: Backend> MLstmcell<B> {
         }
         let bias = Tensor::from_floats(bias_data.as_slice(), device);
 
+        let head_dim = internal_hidden_size / num_heads;
+        let attention_scale = 1.0 / (head_dim as f32).sqrt(); // <-- ESCALA DINÁMICA DE ATENCIÓN
+        
         // Initialize Q, K, V with configured initializer to target internal expanded memory
         let w_q = LinearConfig::new(input_size, internal_hidden_size)
             .with_bias(false)
@@ -327,7 +327,7 @@ impl<B: Backend> MLstmcell<B> {
             epsilon: config.epsilon,
             exp_clamp_min: config.exp_clamp_min,
             exp_clamp_max: config.exp_clamp_max,
-            attention_scale: config.attention_scale,
+            attention_scale,
         }
     }
 
@@ -374,11 +374,6 @@ impl<B: Backend> MLstmcell<B> {
         let v = self.w_v.forward(input_seq.clone())
             .reshape::<4, _>([batch_size, seq_len, self.num_heads, head_dim])
             .swap_dims(1, 2);
-
-        // Escalado manual (Eq. 23 kt = 1/sqrt(d) * k)
-        let k = k * self.attention_scale;
-        // Ya está escalado en K
-
 
         // 2. Parallel Gates (Scalar per head)
         let weight_ih_val = self.weight_ih.val().transpose();
@@ -440,8 +435,8 @@ impl<B: Backend> MLstmcell<B> {
         let weights = (log_weights_masked - m_t_global.clone()).exp(); // [B, H, S, S]
         let initial_scale = (log_initial_contrib - m_t_global.clone()).exp(); // [B, H, S, 1]
         
-        // Puerta de salida (PAPER ACCURATE: Sigmoid)
-        let o_gate = activation::sigmoid(o_log);
+        // --- Puerta de salida (PAPER ACCURATE: Exponential gating stabilized) ---
+        let o_gate = (o_log - m_t_global.clone()).exp();
         
         // H_parallel = (weights @ V)  -- wait, weights is [t, k]
         // We need sum_k weights[t, k] * (v[k] * k[k]^T) ? No. 
@@ -571,8 +566,6 @@ impl<B: Backend> MLstmcell<B> {
         // Projections
         let q = self.w_q.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
         let k = self.w_k.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]);
-        // Scale Key (Eq. 23)
-        let k = k * self.attention_scale;
         let v = self.w_v.forward(input.clone()).reshape::<4, _>([batch_size, self.num_heads, head_dim, 1]);
 
         let m_t_minus_1 = max_gate_log.clone().reshape::<2, _>([batch_size, self.num_heads]); 
@@ -608,8 +601,8 @@ impl<B: Backend> MLstmcell<B> {
         let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator));
         let h_normalized = h_heads / denominator_stable;
         
-        // o_gate (PAPER ACCURATE: Sigmoid)
-        let o_gate = activation::sigmoid(o_log.reshape::<3, _>([batch_size, self.num_heads, 1]));
+        // o_gate stabilized (PAPER ACCURATE)
+        let o_gate = (o_log.reshape::<3, _>([batch_size, self.num_heads, 1]) - m_t.clone().reshape::<3, _>([batch_size, self.num_heads, 1])).exp();
         let h_new = (h_normalized * o_gate).reshape::<2, _>([batch_size, self.internal_hidden_size]);
 
         // Compactación final (Down-Projection)

@@ -25,7 +25,7 @@ fn run_equivalence() {
         &device
     );
     
-    let internal_hidden_size = (hidden_size as f32 * 2.0) as usize; // Default proj_factor is 2.0
+    let internal_hidden_size = (hidden_size as f32 * config.proj_factor) as usize;
     let head_dim = internal_hidden_size / num_heads;
     
     let initial_state = MLstmstate::new(
@@ -321,7 +321,7 @@ fn main() {
     println!("\n--- Ejecutando Test de Gradientes mLSTM ---");
     run_grad_mlstm();
     println!("\n--- Ejecutando Test de Gradiente de Larga Distancia (512 tokens) ---");
-    run_long_distance_grad();
+   run_long_distance_grad();
     println!("\n--- Ejecutando Test de Convergencia Secuencial ---");
     run_convergence_test();
     println!("\n--- Ejecutando Test de Convergencia Recurrente (Estado Paso a Paso) ---");
