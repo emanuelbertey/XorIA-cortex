@@ -466,7 +466,7 @@ impl<B: Backend> MLstmcell<B> {
         let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
         */
         // 1. Producto punto q * k_k^T (K ya viene escalada)
-        let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
+        let qk = q.clone().matmul(k.clone().swap_dims(2, 3)) * self.attention_scale; // [B, H, S, S]
 
         // 2. Aplicamos los pesos de decaimiento escalares a las puntuaciones de atención
         let attention_scores = weights.clone() * qk; // [B, H, S, S]
@@ -475,15 +475,15 @@ impl<B: Backend> MLstmcell<B> {
         let h_parallel = attention_scores.clone().matmul(v.clone()); // [B, H, S, D]
         
         // 4. Contribución del estado inicial (Eq. 21)
-        let h_initial = q.clone()
+        let h_initial = (q.clone() * self.attention_scale)
             .matmul(state.cell.clone().swap_dims(2, 3)) * initial_scale.clone();
 
         // --- Denominator (Eq. 21: max(|nt^T qt|, 1)) ---
         // n_parallel = sum_k weights[t, k] * k_k
         let n_parallel = weights.clone().matmul(k.clone()); // [B, H, S, D]
-        let n_dot_q_parallel = (n_parallel * q.clone()).sum_dim(3).reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]); // [B, H, S, 1]
+        let n_dot_q_parallel = (n_parallel * (q.clone() * self.attention_scale)).sum_dim(3).reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]); // [B, H, S, 1]
         
-        let n_initial_dot_q = (q.clone() * state.normalizer.clone().reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]))
+        let n_initial_dot_q = ((q.clone() * self.attention_scale) * state.normalizer.clone().reshape::<4, _>([batch_size, self.num_heads, 1, head_dim]))
             .sum_dim(3)
             .reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]) * initial_scale.clone();
 
@@ -518,7 +518,7 @@ impl<B: Backend> MLstmcell<B> {
         let final_norm = n_initial_contrib + n_parallel_contrib;
 
         // 3. C_T = exp(F_T - m_T) * C_0 + sum_k (weights[T, k] * v_k @ k_k^T)
-        let c_initial_contrib = state.cell.clone() * last_scale.clone().reshape::<4, _>([batch_size, self.num_heads, 1, 1]);
+        let c_initial_contrib = state.cell.clone() * last_scale.reshape::<4, _>([batch_size, self.num_heads, 1, 1]);
         
         // sum_k weights[T, k] * (v_k @ k_k^T) --> (v_weighted^T @ k)
         let v_weighted = v * last_weights.reshape::<4, _>([batch_size, self.num_heads, seq_len, 1]);
@@ -537,6 +537,7 @@ impl<B: Backend> MLstmcell<B> {
         };
         (y_t, final_state)
     }
+
     /// Forward pass through mLSTM cell with optional state freezing
     pub fn forward_step(
         &self,
@@ -592,11 +593,11 @@ impl<B: Backend> MLstmcell<B> {
             (cn, nn)
         };
 
-        // Read Memory: C_t @ q_t
-        let h_heads = q.clone().matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2);
+        // Read Memory: C_t @ q_t (Con escalado de atención)
+        let h_heads = (q.clone() * self.attention_scale).matmul(c_new.clone().swap_dims(2, 3)).squeeze::<3>(2);
         
-        let q_step = q.clone().reshape::<3, _>([batch_size, self.num_heads, head_dim]);
-        let denominator = (n_new.clone() * q_step).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
+        let q_step_scaled = (q.clone() * self.attention_scale).reshape::<3, _>([batch_size, self.num_heads, head_dim]);
+        let denominator = (n_new.clone() * q_step_scaled).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
         
         let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator));
         let h_normalized = h_heads / denominator_stable;

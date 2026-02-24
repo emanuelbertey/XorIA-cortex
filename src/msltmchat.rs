@@ -369,7 +369,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let num_heads = 4;
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        3e-3, // mLSTM learning rate
+        1e-3, // mLSTM learning rate
         1e-3,
         1e-3, // Other components learning rate (reverted to 1e-3)
     );
@@ -509,13 +509,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 //let (logits, lout) = model.forward(input_batch.clone(), current_state.clone());
                 // use out pero es caro 
                
-               if batch_idx == 0 {
+              /*f batch_idx == 0 {
                 current_state = None;
                /* // Hacemos un forward silencioso para llenar las matrices del mLSTM
                 let (_, warm_state) = model.predict_last(input_batch.clone(), None);
                 current_state = Some(warm_state);*/
                 println!("> Estado inicializado con éxito en el Batch 0 valor none / null");
-            }
+            }*/
                 let (logits, next_state) = model.forward(input_batch.clone(), current_state);
                  //    current_state = Some(next_state.clone());
                 // CRÍTICO: Detach de los estados ocultos entre batches para implementar Truncated BPTT.
@@ -603,7 +603,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("  -> Generando con semilla al azar: '{}'", seed.trim());
                     let gen_start = Instant::now();
                     let generated = generate_text(
-                        &model, // Pasamos referencia sin clonar
+                        &model.valid(), // Pasamos referencia sin clonar
                         &tokenizer,
                         &seed,
                         100, // Generar 100 palabras para ver la capacidad real
