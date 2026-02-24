@@ -365,11 +365,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let seq_length = 128; //32 Reducido para evitar explosión de memoria
     let batch_size = 16; // Mucho más seguro para CPU
     let stride = 128;     //seq_length 64 Salto igual al contexto
-    let num_epochs = 20;
+    let num_epochs = 50;
     let num_heads = 4;
     let lr_config = LearningRateConfig::per_block_type(
         1e-3, // sLSTM learning rate (unused here)
-        8e-4, // mLSTM learning rate
+        3e-3, // mLSTM learning rate
         1e-3,
         1e-3, // Other components learning rate (reverted to 1e-3)
     );
@@ -395,6 +395,7 @@ fn main() -> Result<(), Box<dyn Error>> {
      let config = XLstmconfig::new(vocab_size, hidden_size, num_layers, num_blocks, output_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
+        //.with_use_conv(true)
         .with_lstm_type(LstmType::MLSTM) 
         .with_use_projection(true);   
 

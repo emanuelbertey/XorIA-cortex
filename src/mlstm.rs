@@ -464,14 +464,19 @@ impl<B: Backend> MLstmcell<B> {
         // weights[t, k] acts as the "attention score" A[t, k].
         
         // --- Numerator (C_t @ q_t) ---
-        // MATEMÁTICA EQUIVALENTE:
-        // C_parallel = sum_k weights[t, k] * (v_k @ k_k^T)
-        // h_parallel = q_t @ C_parallel^T 
-        // Por propiedad asociativa: q_t @ (k_k @ v_k^T) == (q_t @ k_k) @ v_k^T
-        // Se preserva la matriz C implícita ahorrando O(S * D^2) memoria.
-        
+        // h_parallel = sum_k weights[t, k] * (q_t @ k_k^T) * v_k
+       
+       /*
+        // 1. Producto punto q * k_k^T para todas las combinaciones t, k
         let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
+        */
+        // 1. Producto punto q * k_k^T (K ya viene escalada)
+        let qk = q.clone().matmul(k.clone().swap_dims(2, 3)); // [B, H, S, S]
+
+        // 2. Aplicamos los pesos de decaimiento escalares a las puntuaciones de atención
         let attention_scores = weights.clone() * qk; // [B, H, S, S]
+       
+        // 3. Resultado final con valores v
         let h_parallel = attention_scores.clone().matmul(v.clone()); // [B, H, S, D]
         
         // 4. Contribución del estado inicial (Eq. 21)
@@ -489,9 +494,8 @@ impl<B: Backend> MLstmcell<B> {
 
         let denominator = n_dot_q_parallel + n_initial_dot_q;
 
-        // Estabilización final escalar (Evitar aplastar gradientes)
-        // Usar + epsilon en lugar de max_pair permite que los gradientes fluyan incluso si denominator < 1
-        let denominator_stable = denominator.clone().abs() + self.epsilon; 
+        // Estabilización final escalar (PAPER ACCURATE: max(|n^T q|, 1))
+        let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator)); 
         
         let h_normalized = (h_parallel + h_initial) / denominator_stable;
         
@@ -601,7 +605,7 @@ impl<B: Backend> MLstmcell<B> {
         let q_step = q.clone().reshape::<3, _>([batch_size, self.num_heads, head_dim]);
         let denominator = (n_new.clone() * q_step).sum_dim(2).reshape([batch_size, self.num_heads, 1]);
         
-        let denominator_stable = denominator.clone().abs() + self.epsilon;
+        let denominator_stable = denominator.clone().abs().max_pair(Tensor::ones_like(&denominator));
         let h_normalized = h_heads / denominator_stable;
         
         // o_gate (PAPER ACCURATE: Sigmoid)

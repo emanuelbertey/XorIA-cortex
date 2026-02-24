@@ -159,6 +159,162 @@ fn run_long_distance_grad() {
     }
 }
 
+fn run_convergence_test() {
+    use burn::optim::{AdamConfig, Optimizer};
+    use burn::nn::loss::CrossEntropyLossConfig;
+    use burn::tensor::TensorData;
+    
+    let device = Default::default();
+    let batch_size = 2;
+    let seq_len = 10;
+    let vocab_size = 16;
+    let hidden_size = 32;
+    let num_heads = 4;
+
+    type AdBackend = Autodiff<TestBackend>;
+
+    // Configuración con projection (factor 2.0 por defecto interno)
+    let config = MLstmconfig::new(vocab_size, hidden_size, 1) // Entrada=16, Salida=32
+        .with_num_heads(num_heads)
+        .with_dropout(0.0);
+    
+    let mut mlstm: MLstm<AdBackend> = config.init(&device);
+    
+    // Proyección manual final a vocabulario para poder calcular la pérdida
+    let final_proj = burn::nn::LinearConfig::new(hidden_size, vocab_size).init(&device);
+
+    let mut optim = AdamConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(&device);
+
+    // Secuencia objetivo determinista (ej. 1, 2, 3...)
+    let mut target_indices = Vec::new();
+    for i in 0..(batch_size * seq_len) {
+        target_indices.push((i % vocab_size) as i64);
+    }
+    let targets = Tensor::<AdBackend, 1, burn::tensor::Int>::from_data(
+        TensorData::new(target_indices.clone(), [batch_size * seq_len]),
+        &device,
+    );
+    // Entradas One-Hot
+    let eye = Tensor::<AdBackend, 2>::eye(vocab_size, &device);
+    let inputs = eye.select(0, targets.clone()).reshape([batch_size, seq_len, vocab_size]);
+
+    let mut loss_start = 0.0;
+    let mut loss_end = 0.0;
+
+    println!("Iniciando Overfit en 100 iteraciones...");
+    for epoch in 0..100 {
+        // Forward
+        let (h_seq, _) = mlstm.forward(&inputs, None);
+        let logits = final_proj.forward(h_seq).reshape([batch_size * seq_len, vocab_size]);
+        
+        let loss = loss_fn.forward(logits.clone(), targets.clone());
+
+        let loss_val = loss.clone().into_data().as_slice::<f32>().unwrap()[0];
+        
+        if epoch == 0 { loss_start = loss_val; }
+        if epoch == 99 { loss_end = loss_val; }
+
+        // Backward
+        let grads = loss.backward();
+        let grads_params = burn::optim::GradientsParams::from_grads(grads, &mlstm);
+        
+        let lr = 0.01;
+        
+        // Optimizar manual
+        mlstm = optim.step(lr, mlstm, grads_params); // LR alto para converger rápido en el test
+    }
+
+    println!("Loss Inicial: {:.4}", loss_start);
+    println!("Loss Final:   {:.4}", loss_end);
+
+    if loss_end < loss_start * 0.1 {
+        println!("✅ TEST CONVERGENCIA PASADO: La red está aprendiendo y redujo el error dramáticamente.");
+    } else {
+        println!("❌ TEST CONVERGENCIA FALLIDO: La red no está aprendiendo a memorizar siquiera una secuencia estática.");
+    }
+}
+
+fn run_convergence_recurrent_test() {
+    use burn::optim::{AdamConfig, Optimizer};
+    use burn::nn::loss::CrossEntropyLossConfig;
+    use burn::tensor::TensorData;
+    
+    let device = Default::default();
+    let batch_size = 2;
+    let seq_len = 10;
+    let vocab_size = 16;
+    let hidden_size = 32;
+    let num_heads = 4;
+
+    type AdBackend = Autodiff<TestBackend>;
+
+    let config = MLstmconfig::new(vocab_size, hidden_size, 1)
+        .with_num_heads(num_heads)
+        .with_dropout(0.0);
+    
+    let mut mlstm: MLstm<AdBackend> = config.init(&device);
+    let final_proj = burn::nn::LinearConfig::new(hidden_size, vocab_size).init(&device);
+
+    let mut optim = AdamConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(&device);
+
+    // Secuencia objetivo determinista
+    let mut target_indices = Vec::new();
+    for i in 0..(batch_size * seq_len) {
+        target_indices.push((i % vocab_size) as i64);
+    }
+    let targets = Tensor::<AdBackend, 1, burn::tensor::Int>::from_data(
+        TensorData::new(target_indices.clone(), [batch_size * seq_len]),
+        &device,
+    ).reshape([batch_size, seq_len]);
+
+    // Entradas One-Hot completas
+    let eye = Tensor::<AdBackend, 2>::eye(vocab_size, &device);
+    let inputs_full = eye.select(0, targets.clone().reshape([batch_size * seq_len])).reshape([batch_size, seq_len, vocab_size]);
+
+    let mut loss_start = 0.0;
+    let mut loss_end = 0.0;
+
+    println!("Iniciando Overfit RECURRENTE (Paso a paso con Estado) en 100 iteraciones...");
+    for epoch in 0..100 {
+        let mut current_state = None;
+        let mut total_loss = Tensor::<AdBackend, 1>::zeros([1], &device);
+        
+        // Loop Recurrente: 1 token a la vez
+        for t in 0..seq_len {
+            let input_t = inputs_full.clone().slice([0..batch_size, t..t+1, 0..vocab_size]);
+            let target_t = targets.clone().slice([0..batch_size, t..t+1]).reshape([batch_size * 1]);
+            
+            let (h_seq, next_state) = mlstm.forward(&input_t, current_state);
+            current_state = Some(next_state);
+            
+            let logits = final_proj.forward(h_seq).reshape([batch_size * 1, vocab_size]);
+            let step_loss = loss_fn.forward(logits, target_t);
+            total_loss = total_loss + step_loss.reshape([1]);
+        }
+        
+        let avg_loss = total_loss.clone() / (seq_len as f32);
+        let loss_val = avg_loss.clone().into_data().as_slice::<f32>().unwrap()[0];
+        
+        if epoch == 0 { loss_start = loss_val; }
+        if epoch == 99 { loss_end = loss_val; }
+
+        let grads = avg_loss.backward();
+        let grads_params = burn::optim::GradientsParams::from_grads(grads, &mlstm);
+        mlstm = optim.step(0.01, mlstm, grads_params);
+    }
+
+    println!("Loss Inicial: {:.4}", loss_start);
+    println!("Loss Final:   {:.4}", loss_end);
+
+    if loss_end < loss_start * 0.1 {
+        println!("✅ TEST RECURRENTE PASADO: El Cell paso a paso transporta correctamente la memoria y el gradiente fluye a través de los estados!");
+    } else {
+        println!("❌ TEST RECURRENTE FALLIDO: La propagación BPTT de estado a estado (forward_step) o la memoria C está matemáticamente rota.");
+    }
+}
+
 fn main() {
     println!("--- Ejecutando Equivalencia Dual/Serial ---");
     run_equivalence();
@@ -166,6 +322,10 @@ fn main() {
     run_grad_mlstm();
     println!("\n--- Ejecutando Test de Gradiente de Larga Distancia (512 tokens) ---");
     run_long_distance_grad();
+    println!("\n--- Ejecutando Test de Convergencia Secuencial ---");
+    run_convergence_test();
+    println!("\n--- Ejecutando Test de Convergencia Recurrente (Estado Paso a Paso) ---");
+    run_convergence_recurrent_test();
 }
 
  // 
