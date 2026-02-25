@@ -29,10 +29,10 @@ fn run_equivalence() {
     let head_dim = internal_hidden_size / num_heads;
     
     let initial_state = MLstmstate::new(
-        Tensor::<TestBackend, 4>::zeros([batch_size, num_heads, head_dim, head_dim], &device),
-        Tensor::<TestBackend, 2>::zeros([batch_size, hidden_size], &device),
-        Tensor::<TestBackend, 3>::zeros([batch_size, num_heads, head_dim], &device),
-        Tensor::<TestBackend, 3>::zeros([batch_size, num_heads, 1], &device),
+        Tensor::<TestBackend, 4>::zeros([batch_size, num_heads, head_dim, head_dim], &device), // cell
+        Tensor::<TestBackend, 2>::zeros([batch_size, hidden_size], &device), // hidden
+        Tensor::<TestBackend, 3>::zeros([batch_size, num_heads, head_dim], &device), // normalizer
+        Tensor::<TestBackend, 3>::zeros([batch_size, num_heads, 1], &device), // max_gate_log
     );
     
     // MODO PARALELO
@@ -48,7 +48,7 @@ fn run_equivalence() {
             .reshape([batch_size, input_size]);
         
         let (output_t, new_state) = cell.forward(&input_t, current_state);
-        outputs_recurrent.push(output_t.reshape::<3, _>([batch_size, 1, hidden_size]));
+        outputs_recurrent.push(output_t.clone().reshape::<3, _>([batch_size, 1, hidden_size]));
         current_state = new_state;
     }
     
