@@ -55,13 +55,13 @@ fn run_equivalence() {
     let output_recurrent: Tensor<TestBackend, 3> = Tensor::cat(outputs_recurrent, 1);
     let final_state_recurrent = current_state;
     
-    let output_diff = (output_parallel.clone() - output_recurrent.clone()).abs().mean().into_scalar();
+    let output_diff: f32 = (output_parallel.clone() - output_recurrent.clone()).abs().mean().into_scalar();
     println!("Diferencia media en outputs: {:.2e}", output_diff);
     
-    let cell_diff = (final_state_parallel.cell.clone() - final_state_recurrent.cell.clone()).abs().mean().into_scalar();
+    let cell_diff: f32 = (final_state_parallel.cell.clone() - final_state_recurrent.cell.clone()).abs().mean().into_scalar();
     println!("Diferencia media en cell states: {:.2e}", cell_diff);
     
-    let norm_diff = (final_state_parallel.normalizer.clone() - final_state_recurrent.normalizer.clone()).abs().mean().into_scalar();
+    let norm_diff: f32 = (final_state_parallel.normalizer.clone() - final_state_recurrent.normalizer.clone()).abs().mean().into_scalar();
     println!("Diferencia media en normalizers: {:.2e}", norm_diff);
     
     if output_diff < 1e-4 {
