@@ -18,7 +18,12 @@ $env:RUST_BACKTRACE=1; cargo run --release --bin mingruchat -- input.txt
 $env:RUST_BACKTRACE=1; cargo run --release --bin mlstm_mingru_chat -- input.txt
 
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- ./data
+<<<<<<< Updated upstream
 $env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- "/media/emabertey/500 wu/Repos/"
+=======
+$env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- "C:/Repos/"
+$env:RUST_BACKTRACE=1; cargo run --release --bin pro_trainer -- "/media/emabertey/500 wu/Windows.old/Users/emabertey/Downloads/dataset/tiny"
+>>>>>>> Stashed changes
 cargo run --release --bin mlstmchat -- input.txt
 
 cargo test test_mlstm_dual_equivalence -- --nocapture

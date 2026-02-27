@@ -149,9 +149,36 @@ En pruebas recientes con la **arquitectura sLSTM**, observamos un salto masivo d
 
 **Español**: Las mejoras y modificaciones realizadas en este fork tienen una licencia doble **MIT** y **Apache 2.0**, siguiendo los estándares del ecosistema de Rust. Se anima al creador original a definir una licencia global para el proyecto.
 
+
+
 ---
 
-Inspired by the project: [https://github.com/thmasq/xlstm-rs](https://github.com/thmasq/xlstm-rs)
+**xLSTM Python to Rust Port:** [github.com/emanuelbertey/xlstm](https://github.com/emanuelbertey/xlstm/tree/main)  
+**Port de xLSTM de Python a Rust:** [github.com/emanuelbertey/xlstm](https://github.com/emanuelbertey/xlstm/tree/main)
+
+---
+
+**Official xLSTM Python Repository:** [github.com/NX-AI/xlstm](https://github.com/NX-AI/xlstm)
+
+If you use this codebase, or otherwise find our work valuable, please cite the xLSTM paper:
+
+```bibtex
+@inproceedings{beck:24xlstm,
+  title = {xLSTM: Extended Long Short-Term Memory}, 
+  author = {Maximilian Beck and Korbinian Pöppel and Markus Spanring and Andreas Auer and Oleksandra Prudnikova and Michael Kopp and Günter Klambauer and Johannes Brandstetter and Sepp Hochreiter},
+  booktitle = {Thirty-eighth Conference on Neural Information Processing Systems},
+  year = {2024},
+  url = {https://arxiv.org/abs/2405.04517}, 
+}
+
+@article{beck:25xlstm7b,
+  title = {{xLSTM 7B}: A Recurrent LLM for Fast and Efficient Inference},
+  author = {Maximilian Beck and Korbinian Pöppel and Phillip Lippe and Richard Kurle and Patrick M. Blies and Günter Klambauer and Sebastian Böck and Sepp Hochreiter},
+  booktitle = {Forty-second International Conference on Machine Learning},
+  year = {2025},
+  url = {https://arxiv.org/abs/2503.13427}
+}
+```
 
 ---
 
